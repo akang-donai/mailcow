@@ -14,9 +14,18 @@ In mailcow, log in as the *mailbox user* (not admin) at
 `https://usagi.mizutech.id:9443` → **App passwords** → Create.
 
 Tick **only** `imap_access`. Leave `smtp_access`, `dav_access`, `eas_access`,
-`pop3_access` and `sieve_access` unticked. Mailcow then rejects SMTP auth for
-this credential at the protocol level, so the restriction does not depend on
-this code behaving.
+`pop3_access` and `sieve_access` unticked. `apppass_login()` in mailcow then
+skips this credential for any service whose `<service>_access` column is not
+`1`, so the restriction does not depend on this code behaving.
+
+Two caveats worth knowing:
+
+- The scoping applies to the **app password only**. `mailcowauth.php` falls
+  through to `user_login()` when no app password matches, and that path checks
+  the *mailbox's* attributes. Restricting an app password does not restrict the
+  mailbox's own login password.
+- Verify the scoping rather than assuming it — see below. A mistyped password
+  is refused by SMTP too, which looks identical to a correctly scoped one.
 
 ### 2. Configure
 
@@ -32,9 +41,13 @@ implicit TLS.
 
     node scripts/smoke.ts
 
-Confirm the app password cannot send:
+Confirm the app password reads mail but cannot send it:
 
-    openssl s_client -connect usagi.mizutech.id:465 -quiet 2>/dev/null <<< $'EHLO t\nAUTH LOGIN\n'
+    node scripts/check-no-smtp.ts
+
+`PASS` requires both legs: IMAP must accept the credential and SMTP must refuse
+that same credential. Anything else prints `FAIL` or `INVALID` and exits
+non-zero.
 
 ### 4. Register with Claude Code
 
@@ -48,7 +61,7 @@ Confirm the app password cannot send:
 
     npm test
 
-32 tests, no network access required.
+42 tests, no network access required.
 
 ## Handling of message content
 
