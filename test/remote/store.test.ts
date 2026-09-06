@@ -140,24 +140,47 @@ test('peekChallenge returns null for an already-consumed code', () => {
 test('subjectClientOf resolves subject and client for a live token', () => {
   const ts = new TokenStore(openDb(':memory:'));
   const tok = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
-  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1' });
+  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1', kind: 'refresh' });
 });
 
 test('subjectClientOf still resolves a consumed token (needed for chain revocation)', () => {
   const ts = new TokenStore(openDb(':memory:'));
   const tok = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
   ts.markConsumed(tok);
-  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1' });
+  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1', kind: 'refresh' });
 });
 
 test('subjectClientOf still resolves a revoked token', () => {
   const ts = new TokenStore(openDb(':memory:'));
   const tok = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
   ts.revoke(tok);
-  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1' });
+  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1', kind: 'refresh' });
 });
 
 test('subjectClientOf returns null for an unknown token', () => {
   const ts = new TokenStore(openDb(':memory:'));
   assert.equal(ts.subjectClientOf('nope'), null);
+});
+
+test('subjectClientOf reports the token kind', () => {
+  const ts = new TokenStore(openDb(':memory:'));
+  const access = ts.issue({ kind: 'access', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 3600 });
+  const refresh = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
+  assert.equal(ts.subjectClientOf(access)?.kind, 'access');
+  assert.equal(ts.subjectClientOf(refresh)?.kind, 'refresh');
+});
+
+test('verify with an expectedKind rejects a token of the wrong kind', () => {
+  const ts = new TokenStore(openDb(':memory:'));
+  const access = ts.issue({ kind: 'access', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 3600 });
+  assert.equal(ts.verify(access, 'refresh'), null);
+  assert.ok(ts.verify(access, 'access'));
+  assert.ok(ts.verify(access)); // no expectedKind: unchanged behaviour
+});
+
+test('markConsumed is single-use: the second call loses the race', () => {
+  const ts = new TokenStore(openDb(':memory:'));
+  const tok = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
+  assert.equal(ts.markConsumed(tok), true);
+  assert.equal(ts.markConsumed(tok), false);
 });

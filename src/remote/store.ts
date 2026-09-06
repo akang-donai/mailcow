@@ -87,9 +87,13 @@ export class TokenStore {
     return token;
   }
 
-  verify(token: string): { clientId: string; subject: string; scope: string; expiresAt: number } | null {
+  // expectedKind, when given, rejects a token whose stored kind differs -- an
+  // access token must never verify as a refresh token or vice versa (see
+  // exchangeRefreshToken / verifyAccessToken in provider.ts, which always pass it).
+  verify(token: string, expectedKind?: 'access' | 'refresh'): { clientId: string; subject: string; scope: string; expiresAt: number } | null {
     const row: any = this.#db.prepare('select * from tokens where token_hash=?').get(hashToken(token));
     if (!row || row.revoked_at || row.consumed_at != null || row.expires_at < nowSec()) return null;
+    if (expectedKind && row.kind !== expectedKind) return null;
     return { clientId: row.client_id, subject: row.subject, scope: row.scope, expiresAt: row.expires_at };
   }
 
@@ -99,8 +103,13 @@ export class TokenStore {
     return row.revoked_at != null || row.consumed_at != null;
   }
 
-  markConsumed(token: string): void {
-    this.#db.prepare('update tokens set consumed_at=? where token_hash=?').run(nowSec(), hashToken(token));
+  // Conditional on consumed_at still being NULL, mirroring CodeStore.consume's
+  // race guard: under the shared-SQLite-file deployment this project assumes, two
+  // workers could otherwise both "successfully" consume the same live refresh
+  // token, and reuse detection would never fire. Returns whether THIS call won.
+  markConsumed(token: string): boolean {
+    const res = this.#db.prepare('update tokens set consumed_at=? where token_hash=? and consumed_at is null').run(nowSec(), hashToken(token));
+    return res.changes === 1;
   }
 
   revoke(token: string): void {
@@ -111,14 +120,16 @@ export class TokenStore {
     this.#db.prepare('update tokens set revoked_at=? where subject=? and client_id=? and revoked_at is null').run(nowSec(), subject, clientId);
   }
 
-  // Resolves subject+client for a token hash even when it is consumed or revoked
-  // (unlike verify(), which treats those as absent). This is how a replayed refresh
-  // token is traced back to the chain that must be revoked -- if this returned null
-  // for a consumed/revoked token, theft detection would silently fail.
-  subjectClientOf(token: string): { subject: string; clientId: string } | null {
-    const row: any = this.#db.prepare('select subject,client_id from tokens where token_hash=?').get(hashToken(token));
+  // Resolves subject+client+kind for a token hash even when it is consumed or
+  // revoked (unlike verify(), which treats those as absent). This is how a
+  // replayed refresh token is traced back to the chain that must be revoked, and
+  // how revokeToken() learns whether a presented token is a refresh token (whose
+  // whole grant must die) or a lone access token -- if this returned null for a
+  // consumed/revoked token, theft detection would silently fail.
+  subjectClientOf(token: string): { subject: string; clientId: string; kind: 'access' | 'refresh' } | null {
+    const row: any = this.#db.prepare('select subject,client_id,kind from tokens where token_hash=?').get(hashToken(token));
     if (!row) return null;
-    return { subject: row.subject, clientId: row.client_id };
+    return { subject: row.subject, clientId: row.client_id, kind: row.kind };
   }
 }
 

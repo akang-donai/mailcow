@@ -4,7 +4,7 @@ import type { OAuthServerProvider, AuthorizationParams } from '@modelcontextprot
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { OAuthClientInformationFull, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import { InvalidGrantError, ServerError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidGrantError, InvalidScopeError, InvalidTokenError, ServerError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { randomToken } from './crypto.ts';
 import type { SqliteClientsStore, CodeStore, TokenStore } from './store.ts';
 
@@ -15,7 +15,7 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
   #codes: CodeStore;
   #tokens: TokenStore;
   #ttls: Ttls;
-  #onAuthorize?: (client: OAuthClientInformationFull, params: AuthorizationParams, res: Response) => void;
+  #onAuthorize?: (client: OAuthClientInformationFull, params: AuthorizationParams, res: Response) => void | Promise<void>;
 
   constructor(deps: { clientsStore: SqliteClientsStore; codes: CodeStore; tokens: TokenStore; ttls: Ttls }) {
     this.#clients = deps.clientsStore;
@@ -34,10 +34,13 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
   // one up yet, failing loudly is safer than silently doing nothing.
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
     if (!this.#onAuthorize) throw new ServerError('authorize handler not configured');
-    this.#onAuthorize(client, params, res);
+    // Awaited so a rejecting async handler surfaces through this method's promise
+    // instead of becoming a floating, unhandled rejection that bypasses the SDK's
+    // error handling.
+    await this.#onAuthorize(client, params, res);
   }
 
-  setOnAuthorize(fn: (client: OAuthClientInformationFull, params: AuthorizationParams, res: Response) => void): void {
+  setOnAuthorize(fn: (client: OAuthClientInformationFull, params: AuthorizationParams, res: Response) => void | Promise<void>): void {
     this.#onAuthorize = fn;
   }
 
@@ -68,30 +71,88 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     return peeked;
   }
 
-  async exchangeAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<OAuthTokens> {
+  async exchangeAuthorizationCode(
+    client: OAuthClientInformationFull,
+    authorizationCode: string,
+    _codeVerifier?: string,
+    redirectUri?: string,
+    _resource?: URL,
+  ): Promise<OAuthTokens> {
     const data = this.#codes.consume(authorizationCode);
     if (!data || data.clientId !== client.client_id) throw new InvalidGrantError('invalid authorization code');
+    // RFC 6749 4.1.3: the redirect_uri presented at the token endpoint must match
+    // the one bound to the code at authorization time. The SDK passes undefined
+    // when the client omitted it (e.g. it was the client's only registered URI);
+    // that is not evidence of tampering, so only a *mismatched* value is rejected.
+    if (redirectUri !== undefined && redirectUri !== data.redirectUri) {
+      throw new InvalidGrantError('redirect_uri does not match the one used to obtain the authorization code');
+    }
     return this.#issuePair(client.client_id, data.subject, 'mail');
   }
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string, scopes?: string[]): Promise<OAuthTokens> {
-    const info = this.#tokens.verify(refreshToken);
+    // Kind is load-bearing: without it, a leaked access token redeemed here would
+    // mint a fresh, indefinitely-renewable pair (and never touch the chain a real
+    // client would replay), and the reuse-detection branch below would trace a
+    // token that was never a refresh token in the first place.
+    const info = this.#tokens.verify(refreshToken, 'refresh');
     if (!info) {
-      // If it exists but is consumed/revoked, this is a replay -> nuke the chain.
+      // Exists (of *some* kind) but failed verify -> could be expired, wrong kind,
+      // or -- the case that matters -- already consumed/revoked, meaning two
+      // parties hold it and one is a thief. Only a genuine refresh-token replay
+      // revokes the chain; a wrong-kind token (e.g. an access token) never reaches
+      // isConsumedOrRevoked()===true here in the ordinary case, since access
+      // tokens are never consumed and are only revoked as part of a chain that's
+      // already dead (a harmless no-op re-revoke).
       if (this.#tokens.isConsumedOrRevoked(refreshToken)) {
         const stale = this.#tokens.subjectClientOf(refreshToken);
         if (stale) this.#tokens.revokeChainBySubjectClient(stale.subject, stale.clientId);
       }
       throw new InvalidGrantError('invalid refresh token');
     }
-    if (info.clientId !== client.client_id) throw new InvalidGrantError('client mismatch');
-    this.#tokens.markConsumed(refreshToken);
-    return this.#issuePair(info.clientId, info.subject, (scopes ?? info.scope.split(' ')).join(' '), refreshToken);
+    if (info.clientId !== client.client_id) {
+      // A LIVE, valid refresh token presented by the wrong client is stronger
+      // evidence of theft than a spent one: another authenticated party currently
+      // holds a working credential for this subject. Kill the real owner's chain
+      // too rather than merely rejecting this one request.
+      this.#tokens.revokeChainBySubjectClient(info.subject, info.clientId);
+      throw new InvalidGrantError('refresh token was not issued to this client');
+    }
+
+    const grantedScopes = info.scope.split(' ');
+    let nextScope = info.scope;
+    if (scopes) {
+      const notGranted = scopes.filter((s) => !grantedScopes.includes(s));
+      if (notGranted.length > 0) {
+        throw new InvalidScopeError(`scope(s) exceed what was granted: ${notGranted.join(' ')}`);
+      }
+      nextScope = scopes.join(' ');
+    }
+
+    // Conditional consume: if this call loses the race (another request already
+    // consumed this exact token), that is itself a replay -- treat it exactly
+    // like the isConsumedOrRevoked() branch above rather than silently minting a
+    // second valid pair from the same single-use refresh token.
+    const won = this.#tokens.markConsumed(refreshToken);
+    if (!won) {
+      const stale = this.#tokens.subjectClientOf(refreshToken);
+      if (stale) this.#tokens.revokeChainBySubjectClient(stale.subject, stale.clientId);
+      throw new InvalidGrantError('invalid refresh token');
+    }
+    return this.#issuePair(info.clientId, info.subject, nextScope, refreshToken);
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const info = this.#tokens.verify(token);
-    if (!info) throw new InvalidGrantError('invalid access token');
+    // expectedKind 'access': a refresh token must never authenticate an MCP
+    // request just because it happens to verify (it would otherwise pass with a
+    // 30-day expiry instead of the intended 1-hour access-token lifetime).
+    const info = this.#tokens.verify(token, 'access');
+    // InvalidTokenError, not InvalidGrantError: the SDK's bearerAuth middleware
+    // special-cases InvalidTokenError to respond 401 + WWW-Authenticate (carrying
+    // the RFC 9728 resource_metadata discovery hint), which is what drives
+    // Claude's re-auth flow. Any other error class falls through to a bare 400
+    // with no challenge header, and the connector just looks broken.
+    if (!info) throw new InvalidTokenError('invalid access token');
     return {
       token,
       clientId: info.clientId,
@@ -102,7 +163,14 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
   }
 
   async revokeToken(_client: OAuthClientInformationFull, request: { token: string }): Promise<void> {
-    this.#tokens.revoke(request.token);
+    // RFC 7009 2.1: revoking a refresh token SHOULD invalidate the entire grant,
+    // not just that one token. An access token, by contrast, is revoked alone.
+    const meta = this.#tokens.subjectClientOf(request.token);
+    if (meta?.kind === 'refresh') {
+      this.#tokens.revokeChainBySubjectClient(meta.subject, meta.clientId);
+    } else {
+      this.#tokens.revoke(request.token);
+    }
   }
 
   #issuePair(clientId: string, subject: string, scope: string, rotatedFrom?: string): OAuthTokens {
