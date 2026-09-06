@@ -15,6 +15,7 @@ import type { MailcowOAuthProvider } from './provider.ts';
 import type { SqliteClientsStore, PendingStore, CredentialStore, TokenStore } from './store.ts';
 import type { TenantRegistry } from './tenant-connections.ts';
 import type { ImapVerifier } from './verify.ts';
+import type { SmtpProbe } from '../smtp-check.ts';
 import { renderConsent, handleConsent, consentView, readConsentCookie } from './consent.ts';
 import { registerRemoteTools } from './tools.ts';
 
@@ -29,6 +30,9 @@ export type AppDeps = {
   issuerUrl: URL;
   imapHost: string;
   imapPort: number;
+  smtpProbe: SmtpProbe;
+  smtpHost: string;
+  smtpPort: number;
 };
 
 // A framable OAuth consent screen is a clickjacking target: an attacker
@@ -127,6 +131,9 @@ export function buildApp(deps: AppDeps): Express {
     verify: deps.verify,
     imapHost: deps.imapHost,
     imapPort: deps.imapPort,
+    smtpProbe: deps.smtpProbe,
+    smtpHost: deps.smtpHost,
+    smtpPort: deps.smtpPort,
   };
 
   // This single value decides BOTH where the SDK mounts the

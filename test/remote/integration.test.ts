@@ -156,7 +156,8 @@ before(async () => {
   });
   const registry = new TenantRegistry({ credentials, connector: fakeFactory });
   const issuerUrl = new URL('http://127.0.0.1');
-  const consentDeps = { pending, credentials, provider, clientsStore, tokens, verify, imapHost: 'usagi', imapPort: 993 };
+  const smtpProbe = async () => 'rejected' as const;
+  const consentDeps = { pending, credentials, provider, clientsStore, tokens, verify, imapHost: 'usagi', imapPort: 993, smtpProbe, smtpHost: 'usagi', smtpPort: 465 };
   provider.setOnAuthorize((client, params, res) =>
     res.redirect(
       beginConsent(consentDeps, res, {
@@ -169,7 +170,7 @@ before(async () => {
       }),
     ),
   );
-  const app = buildApp({ provider, clientsStore, pending, credentials, tokens, registry, verify, issuerUrl, imapHost: 'usagi', imapPort: 993 });
+  const app = buildApp({ provider, clientsStore, pending, credentials, tokens, registry, verify, issuerUrl, imapHost: 'usagi', imapPort: 993, smtpProbe, smtpHost: 'usagi', smtpPort: 465 });
   await new Promise<void>((resolve) => {
     server = app.listen(0, '127.0.0.1', resolve);
   });

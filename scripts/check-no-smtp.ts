@@ -7,13 +7,11 @@
  *   node scripts/check-no-smtp.ts          # every account
  *   node scripts/check-no-smtp.ts harry    # one account
  */
-import tls from 'node:tls';
 import { ImapFlow } from 'imapflow';
 import { loadAccounts, type Account } from '../src/config.ts';
-import { interpretAuthResponse, scopeVerdict } from '../src/smtp-check.ts';
+import { interpretAuthResponse, scopeVerdict, smtpAuthReply } from '../src/smtp-check.ts';
 
 const SMTP_PORT = Number(process.env.MAILCOW_SMTP_PORT ?? 465);
-const b64 = (s: string) => Buffer.from(s).toString('base64');
 
 async function imapAccepts(account: Account): Promise<boolean> {
   const client = new ImapFlow({
@@ -32,27 +30,6 @@ async function imapAccepts(account: Account): Promise<boolean> {
   }
 }
 
-function smtpAuthReply(account: Account): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const socket = tls.connect({ host: account.host, port: SMTP_PORT, servername: account.host });
-    const steps = ['EHLO mcp-check', 'AUTH LOGIN', b64(account.user), b64(account.password)];
-    let step = -1;
-    let buffer = '';
-
-    socket.setTimeout(15000, () => { socket.destroy(); reject(new Error('SMTP check timed out')); });
-    socket.on('error', reject);
-    socket.on('data', (chunk) => {
-      buffer += chunk.toString();
-      const lines = buffer.trimEnd().split(/\r?\n/);
-      if (/^\d{3}-/.test(lines.at(-1)!)) return;   // multiline reply still arriving
-      const last = lines.at(-1)!;
-      if (step === steps.length - 1) { socket.end(); resolve(last); return; }
-      buffer = '';
-      step += 1;
-      socket.write(steps[step] + '\r\n');
-    });
-  });
-}
 
 const wanted = process.argv[2];
 const accounts = loadAccounts(process.env).filter((a) => !wanted || a.name === wanted);
@@ -73,7 +50,7 @@ let failed = 0;
 
 for (const account of accounts) {
   const imapOk = await imapAccepts(account);
-  const reply = await smtpAuthReply(account);
+  const reply = await smtpAuthReply({ host: account.host, port: SMTP_PORT, user: account.user, password: account.password });
   const verdict = scopeVerdict(imapOk, interpretAuthResponse(reply));
 
   console.log(`\n${account.name} (${account.user})`);

@@ -7,7 +7,7 @@ import { SqliteClientsStore, CodeStore, TokenStore, CredentialStore, PendingStor
 import { MailcowOAuthProvider } from '../../src/remote/provider.ts';
 import { renderConsent, beginConsent, handleConsent, consentView, redirectDestination, readConsentCookie, CONSENT_COOKIE } from '../../src/remote/consent.ts';
 
-function fixture(verifyResult: boolean, clientOverrides: Record<string, unknown> = {}) {
+function fixture(verifyResult: boolean, clientOverrides: Record<string, unknown> = {}, smtpProbe: any = async () => 'rejected') {
   const db = openDb(':memory:');
   const clientsStore = new SqliteClientsStore(db);
   clientsStore.registerClient({ client_id: 'c1', client_name: 'Claude', redirect_uris: ['https://claude/cb'], grant_types: ['authorization_code', 'refresh_token'], ...clientOverrides } as any);
@@ -16,7 +16,10 @@ function fixture(verifyResult: boolean, clientOverrides: Record<string, unknown>
   const credentials = new CredentialStore(db, randomBytes(32));
   const pending = new PendingStore(db);
   const verify = async () => verifyResult;
-  return { db, clientsStore, provider, credentials, pending, tokens, deps: { pending, credentials, provider, clientsStore, tokens, verify, imapHost: 'usagi', imapPort: 993 } };
+  return {
+    db, clientsStore, provider, credentials, pending, tokens,
+    deps: { pending, credentials, provider, clientsStore, tokens, verify, imapHost: 'usagi', imapPort: 993, smtpProbe, smtpHost: 'usagi', smtpPort: 465 },
+  };
 }
 
 // A response stub that records the browser-binding cookie beginConsent sets.
@@ -384,4 +387,104 @@ test('a FAILED consent does not revoke anything', async () => {
 
   assert.ok('rerender' in res);
   assert.ok(tokens.verify(existing, 'access'), 'a wrong password must not be a way to log a user out');
+});
+
+// ---------------------------------------------------------------------------
+// Scope verification. The design puts sending out of scope because the
+// credentials are "scoped to imap_access, verified by
+// scripts/check-no-smtp.ts" -- but that script reads Step A's accounts file
+// and cannot see these encrypted per-subject rows. Nothing checked scope at
+// consent time, so pasting a full mailbox password enrolled you and left a
+// send-capable credential in the database: the outcome the design named as
+// the worst one under breach.
+// ---------------------------------------------------------------------------
+
+test('a credential that authenticates to SMTP is refused, and nothing is stored', async () => {
+  const { deps, credentials } = fixture(true, {}, async () => 'accepted');
+  const { handle, browserToken } = begin(deps);
+
+  const res = await handleConsent(deps, { handle, mailbox: 'harry@x', app_password: 'full-mailbox-pw' }, browserToken);
+
+  assert.ok('rerender' in res, 'a send-capable credential must not be enrolled');
+  assert.match((res as any).rerender, /can also SEND mail/i);
+  assert.match((res as any).rerender, /imap_access/, 'the user must be told what to do instead');
+  assert.equal(credentials.get('harry@x'), null, 'a send-capable credential must never reach the database');
+});
+
+test('a credential SMTP refuses is accepted -- that is a correctly scoped app password', async () => {
+  const { deps, credentials } = fixture(true, {}, async () => 'rejected');
+  const { handle, browserToken } = begin(deps);
+
+  const res = await handleConsent(deps, { handle, mailbox: 'harry@x', app_password: 'imap-only-pw' }, browserToken);
+
+  assert.ok('redirectTo' in res);
+  assert.ok(credentials.get('harry@x'));
+});
+
+test('an unreachable SMTP host does not block enrolment, but is logged', async () => {
+  // A mailcow with SMTP disabled, firewalled, or on a STARTTLS-only port
+  // must not make every enrolment on the domain impossible. Inconclusive is
+  // permissive by design -- and noisy, so it is not silently permissive.
+  const { deps, credentials } = fixture(true, {}, async () => 'unknown');
+  const { handle, browserToken } = begin(deps);
+
+  const warnings: unknown[][] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args); };
+  try {
+    const res = await handleConsent(deps, { handle, mailbox: 'harry@x', app_password: 'pw' }, browserToken);
+    assert.ok('redirectTo' in res, 'an unreachable SMTP endpoint must not block enrolment');
+    assert.ok(credentials.get('harry@x'));
+  } finally {
+    console.warn = original;
+  }
+  assert.ok(warnings.length > 0, 'an unverified scope must be logged, not silently accepted');
+  assert.match(String(warnings[0]), /inconclusive|UNVERIFIED/i);
+});
+
+test('a probe that throws is inconclusive, not a 500 and not a pass-as-scoped', async () => {
+  const { deps } = fixture(true, {}, async () => { throw new Error('ECONNREFUSED'); });
+  const { handle, browserToken } = begin(deps);
+  const original = console.warn;
+  console.warn = () => {};
+  try {
+    const res = await handleConsent(deps, { handle, mailbox: 'harry@x', app_password: 'pw' }, browserToken);
+    assert.ok('redirectTo' in res);
+  } finally {
+    console.warn = original;
+  }
+});
+
+test('the scope probe is only consulted after IMAP has proven the credential', async () => {
+  // An SMTP refusal proves nothing about a credential IMAP also refused --
+  // a typo is refused everywhere and would look perfectly scoped. So a bad
+  // password must never even reach the probe.
+  let probed = 0;
+  const { deps } = fixture(false, {}, async () => { probed += 1; return 'rejected' as const; });
+  const { handle, browserToken } = begin(deps);
+
+  const res = await handleConsent(deps, { handle, mailbox: 'harry@x', app_password: 'wrong' }, browserToken);
+
+  assert.ok('rerender' in res);
+  assert.equal(probed, 0, 'the SMTP probe must not run for a credential IMAP already refused');
+});
+
+test('a refused send-capable credential does not revoke the user\'s existing tokens', async () => {
+  const { deps, tokens } = fixture(true, {}, async () => 'accepted');
+  const existing = tokens.issue({ kind: 'access', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 3600 });
+  const { handle, browserToken } = begin(deps);
+
+  await handleConsent(deps, { handle, mailbox: 'harry@x', app_password: 'full-pw' }, browserToken);
+
+  assert.ok(tokens.verify(existing, 'access'), 'a rejected enrolment must not log the user out');
+});
+
+test('the probe receives the configured SMTP host and port and the submitted credential', async () => {
+  const calls: Array<[string, number, string, string]> = [];
+  const { deps } = fixture(true, {}, async (...args: [string, number, string, string]) => { calls.push(args); return 'rejected' as const; });
+  const { handle, browserToken } = begin(deps);
+
+  await handleConsent(deps, { handle, mailbox: 'harry@x', app_password: 'pw-123' }, browserToken);
+
+  assert.deepEqual(calls, [['usagi', 465, 'harry@x', 'pw-123']]);
 });

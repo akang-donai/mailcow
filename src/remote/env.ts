@@ -16,6 +16,8 @@ export type RemoteConfig = {
   keyPath: string;
   imapHost: string;
   imapPort: number;
+  smtpHost: string;
+  smtpPort: number;
 };
 
 function required(env: Record<string, string | undefined>, name: string): string {
@@ -65,5 +67,17 @@ export function loadRemoteConfig(env: Record<string, string | undefined>): Remot
     throw new Error(`MAILCOW_IMAP_PORT ${imapPort} is a cleartext port; implicit TLS is required`);
   }
 
-  return { issuerUrl, port, bindAddr, dbPath, keyPath, imapHost, imapPort };
+  // The SMTP scope probe run at consent time (see src/remote/consent.ts)
+  // proves a submitted app password CANNOT send. It defaults to the same
+  // host as IMAP because on mailcow they are the same server, and to 465
+  // (implicit TLS) because that is what the probe speaks -- a STARTTLS-only
+  // port simply fails to connect, which is treated as inconclusive rather
+  // than as a pass or a block.
+  const smtpHost = env.MAILCOW_SMTP_HOST ?? imapHost;
+  const smtpPort = env.MAILCOW_SMTP_PORT ? Number(env.MAILCOW_SMTP_PORT) : 465;
+  if (!Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535) {
+    throw new Error(`invalid MAILCOW_SMTP_PORT: ${env.MAILCOW_SMTP_PORT}`);
+  }
+
+  return { issuerUrl, port, bindAddr, dbPath, keyPath, imapHost, imapPort, smtpHost, smtpPort };
 }

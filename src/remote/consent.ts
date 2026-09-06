@@ -31,6 +31,7 @@
 //      therefore sets an HttpOnly/Secure/SameSite=Lax cookie scoped to
 //      /consent, and POST /consent requires it to match.
 import { randomToken, hashToken, timingSafeEqualHex } from './crypto.ts';
+import { scopeVerdict, type SmtpProbe } from '../smtp-check.ts';
 import type { PendingStore, CredentialStore, SqliteClientsStore, TokenStore } from './store.ts';
 import type { MailcowOAuthProvider } from './provider.ts';
 import type { ImapVerifier } from './verify.ts';
@@ -44,6 +45,9 @@ export type ConsentDeps = {
   verify: ImapVerifier;
   imapHost: string;
   imapPort: number;
+  smtpProbe: SmtpProbe;
+  smtpHost: string;
+  smtpPort: number;
 };
 
 // The narrowest slice of express.Response beginConsent needs. Declared
@@ -252,6 +256,49 @@ export async function handleConsent(
   const ok = await deps.verify(deps.imapHost, deps.imapPort, mailbox, appPassword);
   if (!ok) {
     return { rerender: renderConsent({ ...view, error: 'Could not sign in to that mailbox with that app password.', mailbox }) };
+  }
+
+  // Scope check. The design puts sending out of scope on the grounds that
+  // the credentials are "scoped to imap_access, verified by
+  // scripts/check-no-smtp.ts" -- but that script reads Step A's accounts
+  // file and has no access to these encrypted per-subject rows. Nothing
+  // checked scope here, so a user who pasted their FULL mailbox password
+  // was enrolled and the database then held a send-capable credential:
+  // exactly the outcome the design rejected as "the worst outcome under
+  // breach".
+  //
+  // Only a SUCCESSFUL SMTP AUTH refuses the enrolment. Anything else --
+  // refused, unparseable, or no SMTP endpoint reachable at all -- lets it
+  // through, because a mailcow with SMTP disabled or firewalled must not
+  // block every enrolment on the domain. The inconclusive case is logged so
+  // it is visible rather than silently permissive.
+  //
+  // The IMAP login above is a precondition, not a convenience: a wrong
+  // password is refused by SMTP too, and would otherwise look perfectly
+  // scoped. That is why scopeVerdict takes both legs.
+  let smtp: Awaited<ReturnType<SmtpProbe>>;
+  try {
+    smtp = await deps.smtpProbe(deps.smtpHost, deps.smtpPort, mailbox, appPassword);
+  } catch {
+    // A probe is contracted not to throw, but a thrown probe must be
+    // inconclusive rather than an unhandled rejection that 500s the form.
+    smtp = 'unknown';
+  }
+  const verdict = scopeVerdict(true, smtp);
+  if (verdict === 'can-send') {
+    return {
+      rerender: renderConsent({
+        ...view,
+        error:
+          'That app password can also SEND mail, so it will not be accepted. In mailcow, create a new app password with only "imap_access" ticked (not "smtp_access"), and use that instead. This connector only ever reads.',
+        mailbox,
+      }),
+    };
+  }
+  if (verdict === 'inconclusive') {
+    console.warn(
+      `mailcp consent: SMTP scope check inconclusive for ${mailbox} via ${deps.smtpHost}:${deps.smtpPort} -- enrolling anyway, this credential's send capability is UNVERIFIED`,
+    );
   }
 
   const client = deps.clientsStore.getClient(pending.clientId);

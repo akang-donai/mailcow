@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { interpretAuthResponse } from '../src/smtp-check.ts';
+import { interpretAuthResponse, makeSmtpProbe } from '../src/smtp-check.ts';
 
 test('535 authentication failure means the credential was rejected', () => {
   assert.equal(interpretAuthResponse('535 5.7.8 Error: authentication failed'), 'rejected');
@@ -43,4 +43,29 @@ test('an unreadable SMTP reply is inconclusive even with a working credential', 
 
 test('a credential IMAP refused but SMTP accepted is not reported as scoped', () => {
   assert.notEqual(scopeVerdict(false, 'accepted'), 'scoped');
+});
+
+// ---------------------------------------------------------------------------
+// makeSmtpProbe: the wrapper the consent handler uses. It must never turn a
+// connection failure into either verdict -- 'unknown' is the only honest
+// answer, and scopeVerdict maps that to 'inconclusive', which is permissive.
+// ---------------------------------------------------------------------------
+
+test('makeSmtpProbe reports unknown, and logs, when SMTP cannot be reached at all', async () => {
+  const logged: string[] = [];
+  // Port 1 on loopback: nothing listens, so tls.connect fails immediately.
+  const probe = makeSmtpProbe({ timeoutMs: 2000, log: (m) => logged.push(m) });
+
+  const outcome = await probe('127.0.0.1', 1, 'harry@x', 'pw');
+
+  assert.equal(outcome, 'unknown');
+  assert.equal(scopeVerdict(true, outcome), 'inconclusive', 'unreachable must not block enrolment');
+  assert.equal(logged.length, 1);
+  assert.match(logged[0]!, /127\.0\.0\.1:1/);
+});
+
+test('an unreachable probe is never reported as scoped', async () => {
+  const probe = makeSmtpProbe({ timeoutMs: 2000 });
+  const outcome = await probe('127.0.0.1', 1, 'harry@x', 'pw');
+  assert.notEqual(scopeVerdict(true, outcome), 'scoped', 'a security check must not pass because it failed to run');
 });

@@ -303,6 +303,28 @@ only** (mailcow: user panel -> App Passwords -> new password, select only
 ever needs to read mail; there is no reason to hand it a credential that
 can also send.
 
+This is **enforced**, not merely requested. After the consent screen's IMAP
+login succeeds, the server tries the same credential against SMTP AUTH at
+`MAILCOW_SMTP_HOST:MAILCOW_SMTP_PORT` (defaults: the IMAP host, port 465,
+implicit TLS). If SMTP *accepts* it, enrolment is refused and the user is
+told to create an `imap_access`-only password -- a full mailbox password
+pasted into the form never reaches the database. If SMTP refuses it, that
+is a correctly scoped password and enrolment proceeds.
+
+If SMTP cannot be reached at all -- disabled, firewalled, or STARTTLS-only
+on the configured port -- the check is **inconclusive and enrolment is
+allowed**, because an unreachable probe must not block every enrolment on
+the domain. That case is logged, so check the container log if you care
+whether the guarantee is actually holding:
+
+```bash
+docker compose logs mailcp | grep -i 'scope check inconclusive'
+```
+
+A line there means those credentials' send capability is unverified. Point
+`MAILCOW_SMTP_HOST`/`MAILCOW_SMTP_PORT` at a reachable implicit-TLS SMTP
+endpoint to close that gap.
+
 Then, in Claude:
 
 - Settings -> Connectors -> Add custom connector

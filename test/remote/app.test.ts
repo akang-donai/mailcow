@@ -31,7 +31,8 @@ function fixture() {
   const verify = async () => true;
   const provider = new MailcowOAuthProvider({ clientsStore, codes, tokens, ttls: { code: 60, access: 3600, refresh: 2592000 } });
 
-  const consentDeps = { pending, credentials, provider, clientsStore, tokens, verify, imapHost: 'usagi', imapPort: 993 };
+  const smtpProbe = async () => 'rejected' as const;
+  const consentDeps = { pending, credentials, provider, clientsStore, tokens, verify, imapHost: 'usagi', imapPort: 993, smtpProbe, smtpHost: 'usagi', smtpPort: 465 };
   provider.setOnAuthorize((client, params, res) => {
     res.redirect(
       beginConsent(consentDeps, res, {
@@ -46,7 +47,7 @@ function fixture() {
   });
 
   const issuerUrl = new URL('https://example.test');
-  const app = buildApp({ provider, clientsStore, pending, credentials, tokens, registry, verify, issuerUrl, imapHost: 'usagi', imapPort: 993 });
+  const app = buildApp({ provider, clientsStore, pending, credentials, tokens, registry, verify, issuerUrl, imapHost: 'usagi', imapPort: 993, smtpProbe, smtpHost: 'usagi', smtpPort: 465 });
   return { app, clientsStore };
 }
 

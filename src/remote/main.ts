@@ -11,6 +11,7 @@ import { openDb } from './db.ts';
 import { SqliteClientsStore, CodeStore, TokenStore, CredentialStore, PendingStore } from './store.ts';
 import { MailcowOAuthProvider } from './provider.ts';
 import { makeImapVerifier } from './verify.ts';
+import { makeSmtpProbe } from '../smtp-check.ts';
 import { TenantRegistry } from './tenant-connections.ts';
 import { buildApp } from './app.ts';
 import { beginConsent, type ConsentDeps } from './consent.ts';
@@ -62,6 +63,10 @@ function main(): void {
     new ImapFlow({ host, port, secure: true, auth: { user, pass }, logger: false });
 
   const verify = makeImapVerifier(imapFactory);
+  // 10s rather than the script's 15: someone is watching the consent form
+  // submit. An unreachable SMTP endpoint is inconclusive, and inconclusive
+  // does not block enrolment, so a slow timeout only costs the user a wait.
+  const smtpProbe = makeSmtpProbe({ timeoutMs: 10_000, log: (m) => console.warn(`mailcp remote: ${m}`) });
   const registry = new TenantRegistry({ credentials, connector: imapFactory });
 
   const provider = new MailcowOAuthProvider({
@@ -80,6 +85,9 @@ function main(): void {
     verify,
     imapHost: cfg.imapHost,
     imapPort: cfg.imapPort,
+    smtpProbe,
+    smtpHost: cfg.smtpHost,
+    smtpPort: cfg.smtpPort,
   };
 
   // The SDK's /authorize handler validates the request (redirect_uri exact
@@ -114,6 +122,9 @@ function main(): void {
     issuerUrl: cfg.issuerUrl,
     imapHost: cfg.imapHost,
     imapPort: cfg.imapPort,
+    smtpProbe,
+    smtpHost: cfg.smtpHost,
+    smtpPort: cfg.smtpPort,
   });
 
   // BIND_ADDR, defaulting to loopback (see env.ts). Two different controls

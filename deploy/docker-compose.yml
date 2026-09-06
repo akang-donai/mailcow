@@ -65,6 +65,12 @@ services:
       KEY_PATH: "/etc/mailcp/key"
       MAILCOW_IMAP_HOST: "usagi.mizutech.id"
       MAILCOW_IMAP_PORT: "993"
+      # Used only for the consent-time scope probe that refuses an app
+      # password which can also SEND mail. Defaults to the IMAP host on 465
+      # if unset; an unreachable SMTP endpoint is inconclusive and does not
+      # block enrolment (it is logged).
+      MAILCOW_SMTP_HOST: "usagi.mizutech.id"
+      MAILCOW_SMTP_PORT: "465"
 
     volumes:
       # Paths are relative to THIS FILE's directory, i.e. deploy/data and

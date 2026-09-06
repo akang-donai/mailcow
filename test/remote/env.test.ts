@@ -60,3 +60,23 @@ test('rejects a BIND_ADDR that is not an IP literal', () => {
   assert.throws(() => loadRemoteConfig({ ...base, BIND_ADDR: '' }), /BIND_ADDR/);
   assert.throws(() => loadRemoteConfig({ ...base, BIND_ADDR: '999.1.1.1' }), /BIND_ADDR/);
 });
+
+// ---------------------------------------------------------------------------
+// SMTP scope probe configuration (see src/remote/consent.ts).
+// ---------------------------------------------------------------------------
+
+test('SMTP probe defaults to the IMAP host on port 465', () => {
+  const c = loadRemoteConfig(base);
+  assert.equal(c.smtpHost, 'usagi.mizutech.id');
+  assert.equal(c.smtpPort, 465);
+});
+
+test('SMTP host and port can be overridden independently of IMAP', () => {
+  const c = loadRemoteConfig({ ...base, MAILCOW_SMTP_HOST: 'smtp.elsewhere.test', MAILCOW_SMTP_PORT: '10465' });
+  assert.equal(c.smtpHost, 'smtp.elsewhere.test');
+  assert.equal(c.smtpPort, 10465);
+});
+
+test('rejects an out-of-range SMTP port', () => {
+  assert.throws(() => loadRemoteConfig({ ...base, MAILCOW_SMTP_PORT: '70000' }), /MAILCOW_SMTP_PORT/);
+});
