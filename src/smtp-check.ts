@@ -15,3 +15,20 @@ export function interpretAuthResponse(line: string): AuthOutcome {
   if (code === '235') return 'accepted';
   return 'unknown';
 }
+
+export type ScopeVerdict = 'scoped' | 'can-send' | 'bad-credential' | 'inconclusive';
+
+/**
+ * Decide whether a credential is genuinely restricted to IMAP.
+ *
+ * SMTP refusing the credential only proves something if the credential is
+ * known good: a typo is refused everywhere and would otherwise look like a
+ * perfectly scoped app password. So the IMAP leg is a precondition, not a
+ * convenience.
+ */
+export function scopeVerdict(imapAuthOk: boolean, smtp: AuthOutcome): ScopeVerdict {
+  if (!imapAuthOk) return 'bad-credential';
+  if (smtp === 'rejected') return 'scoped';
+  if (smtp === 'accepted') return 'can-send';
+  return 'inconclusive';
+}

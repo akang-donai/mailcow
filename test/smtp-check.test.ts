@@ -22,3 +22,25 @@ test('an unrecognised reply is not reported as rejected', () => {
 test('a blank reply is not reported as rejected', () => {
   assert.equal(interpretAuthResponse(''), 'unknown');
 });
+
+import { scopeVerdict } from '../src/smtp-check.ts';
+
+test('a credential that works on IMAP and is refused on SMTP is correctly scoped', () => {
+  assert.equal(scopeVerdict(true, 'rejected'), 'scoped');
+});
+
+test('a credential that works on both can send mail', () => {
+  assert.equal(scopeVerdict(true, 'accepted'), 'can-send');
+});
+
+test('SMTP rejection proves nothing when IMAP also refused the credential', () => {
+  assert.equal(scopeVerdict(false, 'rejected'), 'bad-credential');
+});
+
+test('an unreadable SMTP reply is inconclusive even with a working credential', () => {
+  assert.equal(scopeVerdict(true, 'unknown'), 'inconclusive');
+});
+
+test('a credential IMAP refused but SMTP accepted is not reported as scoped', () => {
+  assert.notEqual(scopeVerdict(false, 'accepted'), 'scoped');
+});
