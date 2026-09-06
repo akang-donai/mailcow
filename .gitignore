@@ -3,3 +3,5 @@ node_modules/
 *.log
 accounts.json
 *.local.json
+.worktrees/
+.superpowers/
