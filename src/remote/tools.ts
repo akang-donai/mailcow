@@ -204,7 +204,16 @@ export function registerRemoteTools(
       if (!r.ok) return text(r.message);
       const p = r.value;
       if (!p.attachments.length) return text('No attachments.');
-      return text(p.attachments.map((a) => `${a.filename ?? '(unnamed)'}  ${a.contentType}  ${a.size} bytes`).join('\n'));
+      // The filename comes from the message's own MIME headers and can carry
+      // an RFC 2047 encoded-word exactly like Subject/From -- same injection
+      // this tool would otherwise be reopening one function over. contentType
+      // is normalised by mailparser (lower risk), but sanitizing it too costs
+      // nothing.
+      return text(
+        p.attachments
+          .map((a) => `${sanitizeHeaderValue(a.filename ?? '(unnamed)')}  ${sanitizeHeaderValue(a.contentType)}  ${a.size} bytes`)
+          .join('\n'),
+      );
     },
   );
 }
