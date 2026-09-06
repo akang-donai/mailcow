@@ -20,12 +20,14 @@ export class SqliteClientsStore implements OAuthRegisteredClientsStore {
       grant_types: row.grant_types ? row.grant_types.split(' ') : undefined,
       scope: row.scope ?? undefined,
       client_id_issued_at: row.created_at,
+      client_secret: row.client_secret ?? undefined,
+      client_secret_expires_at: row.client_secret_expires_at ?? undefined,
     } as OAuthClientInformationFull;
   }
 
   registerClient(client: OAuthClientInformationFull): OAuthClientInformationFull {
     this.#db.prepare(
-      'insert into oauth_clients(client_id,client_name,redirect_uris,grant_types,scope,created_at) values (?,?,?,?,?,?)'
+      'insert into oauth_clients(client_id,client_name,redirect_uris,grant_types,scope,created_at,client_secret,client_secret_expires_at) values (?,?,?,?,?,?,?,?)'
     ).run(
       client.client_id,
       client.client_name ?? null,
@@ -33,6 +35,8 @@ export class SqliteClientsStore implements OAuthRegisteredClientsStore {
       (client.grant_types ?? ['authorization_code', 'refresh_token']).join(' '),
       client.scope ?? null,
       client.client_id_issued_at ?? nowSec(),
+      client.client_secret ?? null,
+      client.client_secret_expires_at ?? null,
     );
     return client;
   }

@@ -27,6 +27,39 @@ test('code store consumes a code exactly once', () => {
   assert.equal(cs.consume('code1'), null); // replay rejected
 });
 
+test('clients store round-trips a confidential client secret and its expiry', async () => {
+  const store = new SqliteClientsStore(openDb(':memory:'));
+  await store.registerClient({
+    client_id: 'c2', redirect_uris: ['https://x/cb'],
+    grant_types: ['authorization_code', 'refresh_token'], client_name: 'Confidential App',
+    client_secret: 'shh-its-a-secret', client_secret_expires_at: 1234567890,
+  } as any);
+  const got = await store.getClient('c2');
+  assert.equal(got?.client_secret, 'shh-its-a-secret');
+  assert.equal(got?.client_secret_expires_at, 1234567890);
+});
+
+test('clients store leaves client_secret undefined for a public client', async () => {
+  const store = new SqliteClientsStore(openDb(':memory:'));
+  await store.registerClient({
+    client_id: 'c3', redirect_uris: ['https://x/cb'],
+    grant_types: ['authorization_code', 'refresh_token'], client_name: 'Public App',
+  } as any);
+  const got = await store.getClient('c3');
+  assert.equal(got?.client_secret, undefined);
+});
+
+test('clients store round-trips client_secret_expires_at as a number', async () => {
+  const store = new SqliteClientsStore(openDb(':memory:'));
+  await store.registerClient({
+    client_id: 'c4', redirect_uris: ['https://x/cb'],
+    grant_types: ['authorization_code', 'refresh_token'], client_name: 'Confidential App',
+    client_secret: 'another-secret', client_secret_expires_at: 42,
+  } as any);
+  const got = await store.getClient('c4');
+  assert.equal(typeof got?.client_secret_expires_at, 'number');
+});
+
 test('code store rejects an expired code', () => {
   const cs = new CodeStore(openDb(':memory:'));
   cs.save('old', { clientId: 'c1', subject: 'harry@x', codeChallenge: 'chal', redirectUri: 'https://x/cb', resource: undefined, ttlSec: -1 });

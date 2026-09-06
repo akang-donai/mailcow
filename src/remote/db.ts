@@ -11,7 +11,9 @@ export function openDb(path: string): DatabaseSync {
       grant_types TEXT NOT NULL,
       scope TEXT,
       created_at INTEGER NOT NULL,
-      last_used_at INTEGER
+      last_used_at INTEGER,
+      client_secret TEXT,
+      client_secret_expires_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS authorization_codes (
       code_hash TEXT PRIMARY KEY,
