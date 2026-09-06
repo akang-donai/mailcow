@@ -62,6 +62,17 @@ export class CodeStore {
     if (res.changes !== 1) return null; // lost the race
     return { clientId: row.client_id, subject: row.subject, codeChallenge: row.code_challenge, redirectUri: row.redirect_uri, resource: row.resource ?? undefined };
   }
+
+  // Reads the stored PKCE challenge without consuming the code. The SDK's token
+  // handler calls this to verify the code_verifier BEFORE exchanging the code, so
+  // this must not mutate consumed_at, and must apply the same expiry/consumed gate
+  // as consume() so a dead code never leaks its challenge.
+  peekChallenge(code: string): string | null {
+    const h = hashToken(code);
+    const row: any = this.#db.prepare('select * from authorization_codes where code_hash=?').get(h);
+    if (!row || row.consumed_at != null || row.expires_at < nowSec()) return null;
+    return row.code_challenge;
+  }
 }
 
 export class TokenStore {
@@ -98,6 +109,16 @@ export class TokenStore {
 
   revokeChainBySubjectClient(subject: string, clientId: string): void {
     this.#db.prepare('update tokens set revoked_at=? where subject=? and client_id=? and revoked_at is null').run(nowSec(), subject, clientId);
+  }
+
+  // Resolves subject+client for a token hash even when it is consumed or revoked
+  // (unlike verify(), which treats those as absent). This is how a replayed refresh
+  // token is traced back to the chain that must be revoked -- if this returned null
+  // for a consumed/revoked token, theft detection would silently fail.
+  subjectClientOf(token: string): { subject: string; clientId: string } | null {
+    const row: any = this.#db.prepare('select subject,client_id from tokens where token_hash=?').get(hashToken(token));
+    if (!row) return null;
+    return { subject: row.subject, clientId: row.client_id };
   }
 }
 

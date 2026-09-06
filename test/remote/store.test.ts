@@ -109,3 +109,55 @@ test('credential store returns null once marked invalid', () => {
   cs.markInvalid('harry@x');
   assert.equal(cs.get('harry@x'), null);
 });
+
+test('peekChallenge returns the stored challenge without consuming the code', () => {
+  const cs = new CodeStore(openDb(':memory:'));
+  cs.save('code1', { clientId: 'c1', subject: 'harry@x', codeChallenge: 'the-challenge', redirectUri: 'https://x/cb', resource: undefined, ttlSec: 60 });
+  assert.equal(cs.peekChallenge('code1'), 'the-challenge');
+  // still consumable afterwards -- peeking must not mark it used
+  const consumed = cs.consume('code1');
+  assert.equal(consumed?.subject, 'harry@x');
+});
+
+test('peekChallenge returns null for an unknown code', () => {
+  const cs = new CodeStore(openDb(':memory:'));
+  assert.equal(cs.peekChallenge('nope'), null);
+});
+
+test('peekChallenge returns null for an expired code', () => {
+  const cs = new CodeStore(openDb(':memory:'));
+  cs.save('old', { clientId: 'c1', subject: 'harry@x', codeChallenge: 'chal', redirectUri: 'https://x/cb', resource: undefined, ttlSec: -1 });
+  assert.equal(cs.peekChallenge('old'), null);
+});
+
+test('peekChallenge returns null for an already-consumed code', () => {
+  const cs = new CodeStore(openDb(':memory:'));
+  cs.save('code1', { clientId: 'c1', subject: 'harry@x', codeChallenge: 'chal', redirectUri: 'https://x/cb', resource: undefined, ttlSec: 60 });
+  cs.consume('code1');
+  assert.equal(cs.peekChallenge('code1'), null);
+});
+
+test('subjectClientOf resolves subject and client for a live token', () => {
+  const ts = new TokenStore(openDb(':memory:'));
+  const tok = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
+  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1' });
+});
+
+test('subjectClientOf still resolves a consumed token (needed for chain revocation)', () => {
+  const ts = new TokenStore(openDb(':memory:'));
+  const tok = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
+  ts.markConsumed(tok);
+  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1' });
+});
+
+test('subjectClientOf still resolves a revoked token', () => {
+  const ts = new TokenStore(openDb(':memory:'));
+  const tok = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
+  ts.revoke(tok);
+  assert.deepEqual(ts.subjectClientOf(tok), { subject: 'harry@x', clientId: 'c1' });
+});
+
+test('subjectClientOf returns null for an unknown token', () => {
+  const ts = new TokenStore(openDb(':memory:'));
+  assert.equal(ts.subjectClientOf('nope'), null);
+});
