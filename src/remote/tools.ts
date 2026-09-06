@@ -4,7 +4,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { listFolders, searchSummaries, fetchEnvelopes, fetchMessageSource, type ImapLike } from '../mailbox.ts';
 import { buildSearchQuery } from '../search.ts';
-import { formatSummary, formatBody, sanitizeHeaderValue } from '../format.ts';
+import { formatSummary, formatMessage, sanitizeHeaderValue, wrapUntrusted } from '../format.ts';
 import { TenantRegistry, CredentialUnavailableError } from './tenant-connections.ts';
 import type { CredentialStore } from './store.ts';
 
@@ -28,6 +28,15 @@ const TRANSIENT =
   'Could not reach your mailbox right now. This looks like a temporary problem, not a permission issue -- please try again in a moment.';
 
 const text = (body: string) => ({ content: [{ type: 'text' as const, text: body }] });
+
+// Message-derived output. Everything a tool reports about a message --
+// sender, subject, filename, body -- is written by whoever sent the mail,
+// so it goes inside explicit untrusted-content markers with any marker the
+// sender embedded defanged over the ASSEMBLED string. Our own operational
+// messages (`text` above: re-authorisation prompts, transient-failure
+// notices, argument errors) are NOT wrapped: they are the server speaking,
+// and marking them untrusted would be a lie in the other direction.
+const untrusted = (body: string) => text(wrapUntrusted(body));
 
 function isAuthenticationFailure(err: unknown): boolean {
   // ImapFlow's AuthenticationFailure sets this as a class field (see
@@ -116,10 +125,10 @@ export function registerRemoteTools(
       });
       if (!r.ok) return text(r.message);
       const msgs = r.value;
-      return text(
+      return untrusted(
         msgs.length
           ? msgs.map((m) => formatSummary(subject, m.uid, m.envelope as never)).join('\n')
-          : `No messages in ${folder}.`,
+          : `No messages in ${sanitizeHeaderValue(folder)}.`,
       );
     },
   );
@@ -147,7 +156,7 @@ export function registerRemoteTools(
       });
       if (!r.ok) return text(r.message);
       const msgs = r.value;
-      return text(
+      return untrusted(
         msgs.length ? msgs.map((m) => formatSummary(subject, m.uid, m.envelope as never)).join('\n') : 'No messages matched.',
       );
     },
@@ -173,8 +182,10 @@ export function registerRemoteTools(
       // body -- an RFC 2047 encoded-word can decode to raw CR/LF, letting a
       // crafted header masquerade as several lines of output or forge a
       // fake "--- BEGIN/END UNTRUSTED EMAIL CONTENT ---" pair. Sanitize
-      // before they are interpolated into a block this tool otherwise
-      // presents as trusted.
+      // each one so it stays on a single line, and put the whole header
+      // block INSIDE the untrusted region (formatMessage) rather than above
+      // it: rendered above the BEGIN marker, these sender-written values sat
+      // in the region the format presents as trusted.
       const fromText = sanitizeHeaderValue(p.from?.text ?? '(unknown sender)');
       const messageSubject = sanitizeHeaderValue(p.subject || '(no subject)');
       const headers = [
@@ -184,7 +195,7 @@ export function registerRemoteTools(
         `Subject: ${messageSubject}`,
         `Attachments: ${p.attachments.length}`,
       ].join('\n');
-      return text(`${headers}\n\n${formatBody(p.text ?? '(no plain text part)', max_chars)}`);
+      return text(formatMessage(headers, p.text ?? '(no plain text part)', max_chars));
     },
   );
 
@@ -203,13 +214,16 @@ export function registerRemoteTools(
       const r = await guard(subject, async () => simpleParser(await fetchMessageSource(await imapFor(subject), folder, uid)));
       if (!r.ok) return text(r.message);
       const p = r.value;
-      if (!p.attachments.length) return text('No attachments.');
+      if (!p.attachments.length) return untrusted('No attachments.');
       // The filename comes from the message's own MIME headers and can carry
       // an RFC 2047 encoded-word exactly like Subject/From -- same injection
       // this tool would otherwise be reopening one function over. contentType
       // is normalised by mailparser (lower risk), but sanitizing it too costs
-      // nothing.
-      return text(
+      // nothing. The listing then goes inside the untrusted markers like any
+      // other message-derived output; previously it had none at all, so a
+      // filename could simply assert whatever it liked with nothing marking
+      // it as sender-written.
+      return untrusted(
         p.attachments
           .map((a) => `${sanitizeHeaderValue(a.filename ?? '(unnamed)')}  ${sanitizeHeaderValue(a.contentType)}  ${a.size} bytes`)
           .join('\n'),
