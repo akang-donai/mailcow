@@ -155,25 +155,73 @@ test('the 401 challenge on /mcp advertises a resource_metadata URL that actually
   }
 });
 
-test("trust proxy is set to 'loopback' (not true), so nginx's X-Forwarded-For is honoured but a direct caller can't spoof it", async () => {
-  const { app } = fixture();
-  assert.equal(app.get('trust proxy'), 'loopback');
+// ---------------------------------------------------------------------------
+// trust proxy. These assert what req.ip actually RESOLVES TO for a request
+// whose socket peer is not loopback -- never what the config value is.
+// Reading the config was how 'loopback' survived review: it is a perfectly
+// sensible-looking setting that is completely inert under Docker, where the
+// socket peer is the bridge gateway (172.x.0.1) rather than 127.0.0.1, so
+// X-Forwarded-For was ignored and every user on the internet shared one
+// rate-limit bucket.
+//
+// The peer address is simulated by overriding remoteAddress on each accepted
+// socket: the connection really is loopback, but Express (via proxy-addr ->
+// forwarded, which reads req.socket.remoteAddress) sees the bridge gateway,
+// exactly as it would inside the container.
+// ---------------------------------------------------------------------------
 
+function listenWithPeer(app: ReturnType<typeof buildApp>, peer: string): Promise<import('node:http').Server> {
+  return new Promise((resolve) => {
+    const server = app.listen(0, '127.0.0.1', () => resolve(server));
+    server.on('connection', (socket) => {
+      Object.defineProperty(socket, 'remoteAddress', { value: peer, configurable: true });
+    });
+  });
+}
+
+async function probeIp(peer: string, forwardedFor: string): Promise<string> {
+  const { app } = fixture();
   // Probe route added directly on the live instance (not part of app.ts)
-  // purely to observe what req.ip resolves to for a real request arriving
-  // from a loopback peer -- exactly nginx's position in production.
+  // purely to observe what req.ip resolves to.
   app.get('/__test_probe_ip', (req, res) => {
     res.json({ ip: req.ip });
   });
-
-  const server = await listen(app);
+  const server = await listenWithPeer(app, peer);
   try {
-    const res = await fetch(`${baseUrl(server)}/__test_probe_ip`, {
-      headers: { 'x-forwarded-for': '203.0.113.5' },
-    });
-    const body = await res.json();
-    assert.equal(body.ip, '203.0.113.5');
+    const res = await fetch(`${baseUrl(server)}/__test_probe_ip`, { headers: { 'x-forwarded-for': forwardedFor } });
+    return ((await res.json()) as { ip: string }).ip;
   } finally {
     server.close();
   }
+}
+
+test("req.ip is the real client for a request arriving from a docker bridge gateway, not the gateway itself", async () => {
+  // The exact production shape: nginx on the host, container on the default
+  // bridge, so the socket peer is 172.17.0.1 for every user alive. With
+  // 'loopback' this returned '172.17.0.1' and the whole internet shared one
+  // rate-limit bucket.
+  assert.equal(await probeIp('172.17.0.1', '203.0.113.5'), '203.0.113.5');
+});
+
+test('req.ip is still the real client when the peer is loopback (bare-metal / non-docker run)', async () => {
+  assert.equal(await probeIp('127.0.0.1', '203.0.113.5'), '203.0.113.5');
+});
+
+test('a client that supplies its own X-Forwarded-For cannot move its rate-limit bucket', async () => {
+  // nginx uses $proxy_add_x_forwarded_for, which APPENDS the peer it
+  // observed -- so a client-supplied value can only ever be prepended.
+  // Trusting exactly one hop reads the rightmost entry, which is nginx's.
+  // `true` would have returned the attacker-chosen '198.51.100.9' here.
+  assert.equal(await probeIp('172.17.0.1', '198.51.100.9, 203.0.113.5'), '203.0.113.5');
+});
+
+test('trust proxy is not true and not loopback', async () => {
+  // Belt and braces on top of the behavioural tests above: both of the
+  // wrong answers this setting has had are named explicitly, so reverting
+  // to either fails here as well as in the req.ip probes.
+  const { app } = fixture();
+  const trust = app.get('trust proxy');
+  assert.notEqual(trust, true);
+  assert.notEqual(trust, 'loopback');
+  assert.equal(trust, 1);
 });

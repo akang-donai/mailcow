@@ -80,15 +80,34 @@ export function buildApp(deps: AppDeps): Express {
   // Standard hardening: don't advertise the framework in responses.
   app.disable('x-powered-by');
 
-  // nginx terminates TLS on this same host and proxies to loopback, so
-  // every request's TCP peer is 127.0.0.1 -- without this, the SDK's
-  // built-in rate limiters on /register, /authorize and /token key every
-  // tenant's traffic to that single address, so one noisy user throttles
-  // the entire mail domain. 'loopback' (never `true`) trusts only
-  // 127.0.0.1/::1 as a forwarding proxy -- exactly and only nginx -- so a
-  // client that reached this process directly still can't spoof
-  // X-Forwarded-For to evade the limiter.
-  app.set('trust proxy', 'loopback');
+  // Exactly one hop -- nginx -- is trusted. Without this the SDK's built-in
+  // rate limiters on /register (20/hr), /token (50/15min) and /authorize
+  // (100/15min) key every tenant's traffic to a single address, so one
+  // caller can block all token refreshes domain-wide for 15 minutes and all
+  // new enrolments for an hour.
+  //
+  // NOT 'loopback', which is inert under Docker: the socket peer there is
+  // the bridge gateway (172.x.0.1), never 127.0.0.1, so X-Forwarded-For was
+  // ignored and req.ip was the gateway for everyone -- one shared bucket
+  // for the whole internet. NOT `true` either, which trusts the entire
+  // chain and lets a caller prepend whatever it likes.
+  //
+  // `1` means "skip the socket peer, take the next address from the right
+  // of X-Forwarded-For". nginx sets that header with
+  // $proxy_add_x_forwarded_for, which APPENDS the real peer, so the
+  // rightmost entry is the address nginx observed. A client that sends its
+  // own X-Forwarded-For only prepends to a list whose last element nginx
+  // still writes.
+  //
+  // What this does not do: distinguish nginx from any other local process.
+  // Express sees a TCP connection, not an identity. Remote clients cannot
+  // reach 8787 (it is published on the host's loopback only), but any
+  // process already running on merbabu can connect to it directly and set
+  // this header to anything. That is not a new exposure -- a compromise of
+  // the shared host is already documented as catastrophic for this service
+  // in deploy/README.md, since the AES key and the database are readable
+  // off disk at that point.
+  app.set('trust proxy', 1);
 
   const consentDeps = {
     pending: deps.pending,
