@@ -17,7 +17,7 @@ const client = new ImapFlow({
 });
 
 await client.connect();
-console.log(`connected: ${config.user}@${config.host}:${config.port}`);
+console.log(`connected: ${config.user} via ${config.host}:${config.port}`);
 
 const imap = client as unknown as ImapLike;
 
