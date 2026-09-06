@@ -1,0 +1,61 @@
+# deploy/docker-compose.yml
+#
+# Deployed from /www/dk_project/dk_app/mailcp/ on merbabu. See
+# deploy/README.md for the full operator runbook (key generation, install,
+# verification, rollback).
+services:
+  mailcp:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    image: mailcp-remote:local
+    container_name: mailcp
+    restart: unless-stopped
+
+    # Container hardening. read_only is safe here because the only paths
+    # this process writes are the two bind mounts below (/var/lib/mailcp)
+    # and /tmp (tmpfs) -- see README "Why read_only works with SQLite".
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+
+    # Loopback only -- unlike every other container on this host, this one
+    # must NOT publish on 0.0.0.0. nginx is the only thing that may reach
+    # it; binding wider would let anything on the LAN bypass nginx's TLS,
+    # rate limits and security headers.
+    ports:
+      - "127.0.0.1:8787:8787"
+
+    # No secrets here. Anything under `environment:` is readable via
+    # `docker inspect` and shown in the aaPanel UI -- the encryption key and
+    # the database are bind mounts instead (below), never env vars.
+    environment:
+      ISSUER_URL: "https://mailcp.mizutech.id"
+      PORT: "8787"
+      DB_PATH: "/var/lib/mailcp/mailcp.sqlite"
+      KEY_PATH: "/etc/mailcp/key"
+      MAILCOW_IMAP_HOST: "usagi.mizutech.id"
+      MAILCOW_IMAP_PORT: "993"
+
+    volumes:
+      # 0700 on the host; writable in the container -- WAL mode needs to
+      # write mailcp.sqlite-wal and mailcp.sqlite-shm next to the DB file,
+      # not just the DB file itself.
+      - ./data:/var/lib/mailcp
+      # 0400 on the host, read-only in the container.
+      - ./secrets/key:/etc/mailcp/key:ro
+
+    # restart: unless-stopped only recovers a process that has exited; it
+    # does nothing for one that is running but wedged. The discovery
+    # document requires no auth and no filesystem/DB access to answer, so
+    # it's a clean liveness probe. node:24-alpine has no curl -- busybox
+    # wget (bundled with Alpine) is used instead.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8787/.well-known/oauth-authorization-server"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

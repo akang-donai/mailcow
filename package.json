@@ -6,7 +6,8 @@
   "description": "Read-only IMAP MCP server for mailcow",
   "scripts": {
     "test": "node --test \"test/**/*.test.ts\"",
-    "start": "node src/server.ts"
+    "start": "node src/server.ts",
+    "start:remote": "node src/remote/main.ts"
   },
   "engines": {
     "node": ">=24"
