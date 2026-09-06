@@ -137,6 +137,17 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 A `curl: (7) Failed to connect` here with the container reporting `healthy`
 is the signature of the bind-address mistake described below.
 
+The reverse is also possible, though unlikely: the curl above succeeds but
+`docker compose ps` reports `unhealthy`. That means `hostname -i` inside the
+container did not resolve to the address the published port DNATs to. The
+service is fine; the probe is not. Check with
+`docker compose exec mailcp hostname -i`, and if it prints something
+unexpected, replace `$$(hostname -i | cut -d' ' -f1)` in the healthcheck
+with the container's actual bridge address from
+`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mailcp`.
+Do not "simplify" it back to `127.0.0.1`: that is the probe that reported
+healthy on a completely dead service.
+
 ### Bind address vs published port -- do not "fix" `BIND_ADDR` back
 
 These are two different controls and confusing them shipped this service
