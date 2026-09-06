@@ -100,13 +100,33 @@ export function buildApp(deps: AppDeps): Express {
     imapPort: deps.imapPort,
   };
 
+  // This single value decides BOTH where the SDK mounts the
+  // .well-known/oauth-protected-resource document (via resourceServerUrl
+  // below -- its path becomes the mount's suffix) AND what URL the 401
+  // WWW-Authenticate challenge on /mcp actually points a client at (via
+  // resourceMetadataUrl further down). Those two must never be computed
+  // independently: they previously were (one from issuerUrl, one from
+  // `/mcp` off issuerUrl), so the document mounted at the issuer root while
+  // the challenge advertised `<issuer>/mcp` -- a 404 on the exact discovery
+  // request an unauthenticated Claude connector makes first.
+  const resourceServerUrl = new URL('/mcp', deps.issuerUrl);
+
   // Installs /authorize, /token, /register, /revoke and the .well-known
-  // metadata endpoints. /authorize's validation (redirect_uri exact match,
-  // S256 enforcement, client lookup) stays entirely inside the SDK; once it
+  // metadata endpoints (including the protected-resource document, mounted
+  // under resourceServerUrl's path so it lines up with resourceMetadataUrl
+  // below). /authorize's validation (redirect_uri exact match, S256
+  // enforcement, client lookup) stays entirely inside the SDK; once it
   // passes, it calls provider.authorize(client, params, res), which main.ts
   // wires (via provider.setOnAuthorize) to redirect into the consent flow
   // built from consentDeps above.
-  app.use(mcpAuthRouter({ provider: deps.provider, issuerUrl: deps.issuerUrl }));
+  app.use(
+    mcpAuthRouter({
+      provider: deps.provider,
+      issuerUrl: deps.issuerUrl,
+      resourceServerUrl,
+      resourceName: 'mailcow IMAP (read-only)',
+    }),
+  );
 
   app.get('/consent', (req, res) => {
     const handle = typeof req.query.handle === 'string' ? req.query.handle : '';
@@ -127,7 +147,7 @@ export function buildApp(deps: AppDeps): Express {
     res.type('html').send(result.rerender);
   });
 
-  const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(new URL('/mcp', deps.issuerUrl));
+  const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceServerUrl);
 
   app.post(
     '/mcp',

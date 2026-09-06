@@ -117,6 +117,44 @@ test('a structured OAuth error (unsupported grant type) still returns its proper
   }
 });
 
+test('the 401 challenge on /mcp advertises a resource_metadata URL that actually resolves, not a 404 (RFC 9728 discovery)', async () => {
+  const { app } = fixture();
+  const server = await listen(app);
+  try {
+    const res = await fetch(`${baseUrl(server)}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    assert.equal(res.status, 401);
+    const wwwAuth = res.headers.get('www-authenticate');
+    assert.ok(wwwAuth, 'expected a WWW-Authenticate header');
+    // Parsed out of the header, not hardcoded -- hardcoding the path here
+    // would let the mount path (mcpAuthRouter's resourceServerUrl) and the
+    // advertised path (requireBearerAuth's resourceMetadataUrl) drift apart
+    // again without this test ever noticing.
+    const match = wwwAuth!.match(/resource_metadata="([^"]+)"/);
+    assert.ok(match, `expected a resource_metadata challenge parameter in: ${wwwAuth}`);
+    const advertised = new URL(match![1]);
+
+    // fixture()'s issuerUrl is an unreachable placeholder domain, so the
+    // advertised URL can't literally be fetched cross-network -- but Express
+    // routes purely on method + path, never on the Host header, so fetching
+    // the identical path against our own live server exercises exactly the
+    // same routing decision the real client would make.
+    const metaRes = await fetch(`${baseUrl(server)}${advertised.pathname}`);
+    assert.equal(metaRes.status, 200, `resource_metadata URL path ${advertised.pathname} must resolve, not 404`);
+    const body = (await metaRes.json()) as { resource?: string; authorization_servers?: string[] };
+    assert.equal(body.resource, 'https://example.test/mcp');
+    assert.ok(
+      Array.isArray(body.authorization_servers) && body.authorization_servers.includes('https://example.test/'),
+      `expected authorization_servers to include the issuer: ${JSON.stringify(body)}`,
+    );
+  } finally {
+    server.close();
+  }
+});
+
 test("trust proxy is set to 'loopback' (not true), so nginx's X-Forwarded-For is honoured but a direct caller can't spoof it", async () => {
   const { app } = fixture();
   assert.equal(app.get('trust proxy'), 'loopback');
