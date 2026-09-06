@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { openDb } from '../../src/remote/db.ts';
-import { SqliteClientsStore, CodeStore, TokenStore, CredentialStore } from '../../src/remote/store.ts';
+import { SqliteClientsStore, CodeStore, TokenStore, CredentialStore, PendingStore } from '../../src/remote/store.ts';
 
 const key = randomBytes(32);
 const now = () => Math.floor(Date.now() / 1000);
@@ -183,4 +183,40 @@ test('markConsumed is single-use: the second call loses the race', () => {
   const tok = ts.issue({ kind: 'refresh', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 1000 });
   assert.equal(ts.markConsumed(tok), true);
   assert.equal(ts.markConsumed(tok), false);
+});
+
+test('pending store round-trips a saved handle', () => {
+  const ps = new PendingStore(openDb(':memory:'));
+  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', state: 'st', resource: 'res', scopes: ['mail'], ttlSec: 600 });
+  assert.deepEqual(ps.get('h1'), {
+    clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', state: 'st', resource: 'res', scopes: ['mail'],
+  });
+});
+
+test('pending store get returns null for an unknown handle', () => {
+  const ps = new PendingStore(openDb(':memory:'));
+  assert.equal(ps.get('nope'), null);
+});
+
+test('pending store get returns null for an expired handle', () => {
+  const ps = new PendingStore(openDb(':memory:'));
+  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', ttlSec: -1 });
+  assert.equal(ps.get('h1'), null);
+});
+
+test('pending store delete removes the row so a subsequent get is null', () => {
+  const ps = new PendingStore(openDb(':memory:'));
+  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', ttlSec: 600 });
+  ps.delete('h1');
+  assert.equal(ps.get('h1'), null);
+});
+
+test('pending store persists the handle hashed, never in the clear', () => {
+  const db = openDb(':memory:');
+  const ps = new PendingStore(db);
+  const handle = 'raw-handle-should-never-appear-in-storage';
+  ps.save(handle, { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', ttlSec: 600 });
+  const row: any = db.prepare('select * from pending_authorizations').get();
+  assert.notEqual(row.handle_hash, handle);
+  assert.ok(!JSON.stringify(row).includes(handle));
 });

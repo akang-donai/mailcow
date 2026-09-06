@@ -160,3 +160,44 @@ export class CredentialStore {
     this.#db.prepare('update credentials set last_used_at=? where subject=?').run(nowSec(), subject);
   }
 }
+
+type PendingData = {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  state?: string;
+  resource?: string;
+  scopes?: string[];
+};
+
+// Backs the consent handoff between the SDK's /authorize route and the
+// mailbox-credential form at /consent. The handle is a bearer value (whoever
+// holds it can complete the pending authorization), so it is stored hashed
+// -- exactly like an authorization code or token -- never in the clear.
+export class PendingStore {
+  #db: DatabaseSync;
+  constructor(db: DatabaseSync) { this.#db = db; }
+
+  save(handle: string, d: PendingData & { ttlSec: number }): void {
+    this.#db.prepare(
+      'insert into pending_authorizations(handle_hash,client_id,redirect_uri,code_challenge,state,resource,scopes,expires_at) values (?,?,?,?,?,?,?,?)'
+    ).run(hashToken(handle), d.clientId, d.redirectUri, d.codeChallenge, d.state ?? null, d.resource ?? null, (d.scopes ?? []).join(' '), nowSec() + d.ttlSec);
+  }
+
+  get(handle: string): (PendingData & { scopes: string[] }) | null {
+    const row: any = this.#db.prepare('select * from pending_authorizations where handle_hash=?').get(hashToken(handle));
+    if (!row || row.expires_at < nowSec()) return null;
+    return {
+      clientId: row.client_id,
+      redirectUri: row.redirect_uri,
+      codeChallenge: row.code_challenge,
+      state: row.state ?? undefined,
+      resource: row.resource ?? undefined,
+      scopes: row.scopes ? row.scopes.split(' ') : [],
+    };
+  }
+
+  delete(handle: string): void {
+    this.#db.prepare('delete from pending_authorizations where handle_hash=?').run(hashToken(handle));
+  }
+}
