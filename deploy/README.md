@@ -36,12 +36,11 @@ encrypted, offline, and know who is allowed to touch it.
 
 ## 2. Bring the stack up
 
-```bash
-docker compose up -d --build
-```
-
-Before doing this in production, pin the base image by digest instead of
-building against a floating `node:24-alpine` tag:
+**Pin the base image by digest before the first build.** Do this now, not
+after — `deploy/Dockerfile` as checked in builds against the floating
+`node:24-alpine` tag, and once the build command further down has built and
+started the container against it, you've already taken on the exact risk
+this pin exists to prevent.
 
 ```bash
 docker pull node:24-alpine
@@ -61,6 +60,13 @@ line. Two independent reasons this matters here, not just general hygiene:
 - A floating `:alpine` tag can change under you on any rebuild (security
   patches, base image bumps). A digest is the only thing that guarantees
   "the image I tested is the image running in production."
+
+Only once `deploy/Dockerfile` has been edited to reference the pinned
+digest:
+
+```bash
+docker compose up -d --build
+```
 
 Check the container came up and is passing its healthcheck:
 
@@ -159,7 +165,55 @@ Expected: HTTP 401, with a `WWW-Authenticate` header present. This is the
 MCP SDK's bearer-auth challenge, and confirms the request actually reached
 the container rather than nginx or something else answering on its behalf.
 
-Only proceed to step 5 once both checks pass from outside the network.
+### Also verify the TLS pin actually took effect
+
+`nginx-mcp.conf`'s `ssl_protocols`/`ssl_ciphers` lines are legal inside the
+per-site `server {}` block, but nginx applies **last one wins** within a
+context. If aaPanel's own vhost-managed SSL block emits its own
+`ssl_protocols` *after* the point where it includes the `extension/`
+directory, your pin is silently overridden — `nginx -t` has no way to warn
+about this, because both directives are individually valid; only their
+order matters.
+
+On the host, check which value actually won:
+
+```bash
+nginx -T | grep -A1 ssl_protocols
+```
+
+Expected: `ssl_protocols TLSv1.2 TLSv1.3;` for the `mailcp.mizutech.id`
+server block. If it instead shows the panel default (typically including
+`TLSv1.1`), the extension include is being loaded too early relative to
+the panel's own SSL block — the pin is not living, even though `nginx -t`
+passed and the site is otherwise reachable.
+
+Then, from the same outside-the-network machine as the checks above,
+confirm the server itself refuses a TLS 1.1 handshake:
+
+```bash
+openssl s_client -connect mailcp.mizutech.id:443 -tls1_1
+```
+
+Expected (pin is working): the connection fails — something like
+`ssl_choose_client_version:unsupported protocol` or
+`tlsv1 alert protocol version`, with no certificate printed and no
+`Cipher is` line showing a negotiated cipher. If instead you get a
+successful handshake (a certificate chain, `SSL-Session:`, and
+`Protocol  : TLSv1.1`), the pin did not take effect server-side — go back
+to the `nginx -T` check above.
+
+Note: some OpenSSL builds (notably recent Debian/Ubuntu defaults and
+Homebrew's OpenSSL 3.x) disable TLS 1.1 entirely at compile time and will
+refuse to even attempt the handshake, printing something like
+`unsupported protocol` before a single packet leaves the machine. That is
+a **client-side** refusal and proves nothing about the server. If you see
+this, either run the command from a machine/container with an older
+OpenSSL (e.g. `docker run --rm alpine/openssl s_client -connect
+mailcp.mizutech.id:443 -tls1_1`, since many minimal images still ship
+OpenSSL 1.1) or fall back to `nginx -T` alone as your evidence.
+
+Only proceed to step 5 once all three checks — discovery document, `/mcp`
+401, and the TLS pin — pass from outside the network.
 
 ## 5. Add the connector in Claude
 
