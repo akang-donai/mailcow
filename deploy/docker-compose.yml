@@ -1,27 +1,53 @@
 # deploy/docker-compose.yml
 #
-# Deployed from /www/dk_project/dk_app/mailcp/ on merbabu. See
-# deploy/README.md for the full operator runbook (key generation, install,
-# verification, rollback).
+# Run every command in this file's directory:
+#     cd /www/dk_project/dk_app/mailcp/deploy && docker compose up -d --build
+#
+# That is not a style preference. Compose resolves relative bind mounts
+# against the COMPOSE FILE's directory, not the shell's working directory,
+# so `./data` and `./secrets/key` below always mean `deploy/data` and
+# `deploy/secrets/key` no matter where you invoke it from. Running from
+# anywhere else and pointing at this file with `-f` would create the
+# key/database in one place and mount them from another. See
+# deploy/README.md for the full operator runbook.
 services:
   mailcp:
+    # Context is the repo root (one level up) because the image needs
+    # package.json, package-lock.json and src/. What that context may NOT
+    # carry is the key or the database -- see the repo-root .dockerignore,
+    # which excludes secrets/, data/, deploy/secrets/, deploy/data/, .git
+    # and node_modules. The spec's invariant is that the AES key never
+    # reaches an image or a build layer; today nothing COPYs it, and
+    # .dockerignore makes sure a future `COPY . .` still cannot.
     build: { context: .., dockerfile: deploy/Dockerfile }
     image: mailcp-remote:local
     container_name: mailcp
     restart: unless-stopped
 
-    # Container hardening. read_only is safe here because the only paths
-    # this process writes are the two bind mounts below (/var/lib/mailcp)
-    # and /tmp (tmpfs) -- see README "Why read_only works with SQLite".
+    # The image declares USER node (uid 1000). The bind-mounted key and data
+    # directory must therefore be owned by uid 1000 ON THE HOST:
+    #     chown -R 1000:1000 data secrets
+    # A bind mount carries the host's ownership straight through; Docker
+    # does not chown it for you. Without this the container starts, fails to
+    # read /etc/mailcp/key (EACCES) or to write the SQLite WAL files, and
+    # sits in a restart loop. Ownership is fixed on the host rather than
+    # with a `user:` override here precisely so that the container keeps
+    # running as a non-root user.
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs: [/tmp]
 
-    # Loopback only -- unlike every other container on this host, this one
-    # must NOT publish on 0.0.0.0. nginx is the only thing that may reach
-    # it; binding wider would let anything on the LAN bypass nginx's TLS,
-    # rate limits and security headers.
+    # HOST-side isolation. This is the line that keeps the service off the
+    # LAN: the port is published on the host's loopback only, so nothing on
+    # 192.168.57.0/24 can reach it and nginx remains the only way in.
+    #
+    # It is NOT the same control as BIND_ADDR below. Docker DNATs a
+    # published port to the container's *bridge* address, so the in-
+    # container listener must bind 0.0.0.0 to receive anything through this
+    # mapping. Binding the container's own 127.0.0.1 (the previous
+    # behaviour) made every proxied request fail with connection-refused
+    # while `docker compose ps` still said healthy.
     ports:
       - "127.0.0.1:8787:8787"
 
@@ -31,26 +57,41 @@ services:
     environment:
       ISSUER_URL: "https://mailcp.mizutech.id"
       PORT: "8787"
+      # Required under bridge networking; see the ports: comment above.
+      # Do not "fix" this back to 127.0.0.1 -- the loopback in the mapping
+      # above is what provides the isolation, not this value.
+      BIND_ADDR: "0.0.0.0"
       DB_PATH: "/var/lib/mailcp/mailcp.sqlite"
       KEY_PATH: "/etc/mailcp/key"
       MAILCOW_IMAP_HOST: "usagi.mizutech.id"
       MAILCOW_IMAP_PORT: "993"
 
     volumes:
-      # 0700 on the host; writable in the container -- WAL mode needs to
-      # write mailcp.sqlite-wal and mailcp.sqlite-shm next to the DB file,
-      # not just the DB file itself.
+      # Paths are relative to THIS FILE's directory, i.e. deploy/data and
+      # deploy/secrets/key. Both must exist, be owned by 1000:1000, and --
+      # for the key -- be a FILE before the first `up`: Docker silently
+      # creates a missing bind-mount source as an empty DIRECTORY, and
+      # loadKey() then dies with EISDIR in a restart loop.
+      #
+      # 0700, owned by 1000:1000 on the host; writable in the container --
+      # WAL mode needs to write mailcp.sqlite-wal and mailcp.sqlite-shm next
+      # to the DB file, not just the DB file itself.
       - ./data:/var/lib/mailcp
-      # 0400 on the host, read-only in the container.
+      # 0400, owned by 1000:1000 on the host; read-only in the container.
       - ./secrets/key:/etc/mailcp/key:ro
 
     # restart: unless-stopped only recovers a process that has exited; it
-    # does nothing for one that is running but wedged. The discovery
-    # document requires no auth and no filesystem/DB access to answer, so
-    # it's a clean liveness probe. node:24-alpine has no curl -- busybox
-    # wget (bundled with Alpine) is used instead.
+    # does nothing for one that is running but wedged.
+    #
+    # This probe deliberately targets the container's own BRIDGE address
+    # (`hostname -i`), not 127.0.0.1. A loopback probe passes even when the
+    # listener is bound somewhere the published port cannot reach it, which
+    # is exactly how a completely unreachable service reported `healthy`.
+    # node:24-alpine has no curl -- busybox wget and hostname are used.
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8787/.well-known/oauth-authorization-server"]
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null "http://$$(hostname -i | cut -d' ' -f1):8787/.well-known/oauth-authorization-server"
       interval: 30s
       timeout: 5s
       start_period: 10s

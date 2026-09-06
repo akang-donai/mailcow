@@ -112,13 +112,24 @@ function main(): void {
     imapPort: cfg.imapPort,
   });
 
-  // Loopback only. nginx terminates TLS and applies rate limiting in front
-  // of this process; binding to anything wider (e.g. 0.0.0.0) would let
-  // every other host on the LAN reach the OAuth and MCP endpoints directly,
-  // bypassing TLS, mailcow's rate limits, and the security headers set in
-  // app.ts.
-  app.listen(cfg.port, '127.0.0.1', () => {
-    console.log(`mailcp remote listening on 127.0.0.1:${cfg.port}`);
+  // BIND_ADDR, defaulting to loopback (see env.ts). Two different controls
+  // are easy to confuse here, and confusing them is how this service was
+  // shipped completely unreachable:
+  //
+  //   * the BIND ADDRESS decides which interface *inside this network
+  //     namespace* the listener attaches to;
+  //   * what keeps the service off the LAN in the container deployment is
+  //     the HOST-SIDE port publication (`127.0.0.1:8787:8787` in
+  //     deploy/docker-compose.yml).
+  //
+  // Under Docker's default bridge networking, a published port is DNATed to
+  // the container's bridge address, so a listener on the container's own
+  // 127.0.0.1 refuses every proxied connection -- while the healthcheck,
+  // which runs inside the container and does use loopback, keeps reporting
+  // healthy. Hence BIND_ADDR=0.0.0.0 in the compose file, and loopback for
+  // a bare-metal run where no such mapping exists.
+  app.listen(cfg.port, cfg.bindAddr, () => {
+    console.log(`mailcp remote listening on ${cfg.bindAddr}:${cfg.port}`);
   });
 }
 

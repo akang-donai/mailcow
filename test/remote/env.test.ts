@@ -27,3 +27,36 @@ test('rejects a cleartext IMAP port (143)', () => {
 test('rejects a cleartext IMAP port (110)', () => {
   assert.throws(() => loadRemoteConfig({ ...base, MAILCOW_IMAP_PORT: '110' }), /cleartext|TLS/i);
 });
+
+// ---------------------------------------------------------------------------
+// BIND_ADDR. The listener's bind address is configurable because a container
+// published as 127.0.0.1:8787:8787 DNATs to the container's *bridge*
+// address -- a process bound to the container's own loopback is unreachable
+// through that mapping, so nginx gets connection-refused on every request
+// while the in-container healthcheck (which does use loopback) still passes.
+// Bare-metal use must stay loopback-only, so that is the default.
+// ---------------------------------------------------------------------------
+
+test('bind address defaults to loopback when BIND_ADDR is not set', () => {
+  assert.equal(loadRemoteConfig(base).bindAddr, '127.0.0.1');
+});
+
+test('accepts BIND_ADDR 0.0.0.0, which is what the container needs', () => {
+  assert.equal(loadRemoteConfig({ ...base, BIND_ADDR: '0.0.0.0' }).bindAddr, '0.0.0.0');
+});
+
+test('accepts an explicit loopback and an IPv6 bind address', () => {
+  assert.equal(loadRemoteConfig({ ...base, BIND_ADDR: '127.0.0.1' }).bindAddr, '127.0.0.1');
+  assert.equal(loadRemoteConfig({ ...base, BIND_ADDR: '::' }).bindAddr, '::');
+  assert.equal(loadRemoteConfig({ ...base, BIND_ADDR: '::1' }).bindAddr, '::1');
+});
+
+test('rejects a BIND_ADDR that is not an IP literal', () => {
+  // A hostname is resolved by listen() at startup, so a DNS or hosts-file
+  // change could silently move the listener to a wider interface. Refused
+  // outright rather than resolved.
+  assert.throws(() => loadRemoteConfig({ ...base, BIND_ADDR: 'localhost' }), /BIND_ADDR/);
+  assert.throws(() => loadRemoteConfig({ ...base, BIND_ADDR: 'not an address' }), /BIND_ADDR/);
+  assert.throws(() => loadRemoteConfig({ ...base, BIND_ADDR: '' }), /BIND_ADDR/);
+  assert.throws(() => loadRemoteConfig({ ...base, BIND_ADDR: '999.1.1.1' }), /BIND_ADDR/);
+});
