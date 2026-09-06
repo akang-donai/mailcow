@@ -7,20 +7,30 @@ import { TenantRegistry, CredentialUnavailableError } from '../../src/remote/ten
 
 const key = randomBytes(32);
 
-function fixture(opts: { maxConnections?: number; idleMs?: number } = {}) {
+function fixture(opts: { maxConnections?: number; idleMs?: number; failFirstConnect?: boolean } = {}) {
+  const { failFirstConnect, ...registryOpts } = opts;
   const creds = new CredentialStore(openDb(':memory:'), key);
   creds.put('harry@x', 'usagi', 993, 'harry-pw');
   creds.put('dea@x', 'usagi', 993, 'dea-pw');
   const dials: Array<{ user: string; pass: string }> = [];
   let clock = 1000;
   const clients = new Map<string, any>();
+  let failures = failFirstConnect ? 1 : 0;
   const connector = (host: string, port: number, user: string, pass: string) => {
     dials.push({ user, pass });
-    const c = { usable: false, connect: async () => { c.usable = true; }, logout: async () => { c.usable = false; }, forceUnusable: () => { c.usable = false; } };
+    const c = {
+      usable: false,
+      connect: async () => {
+        if (failures > 0) { failures -= 1; throw new Error('connect refused'); }
+        c.usable = true;
+      },
+      logout: async () => { c.usable = false; },
+      forceUnusable: () => { c.usable = false; },
+    };
     clients.set(user, c);
     return c;
   };
-  const registry = new TenantRegistry({ credentials: creds, connector, clock: () => clock, ...opts });
+  const registry = new TenantRegistry({ credentials: creds, connector, clock: () => clock, ...registryOpts });
   return { registry, dials, clients, creds, tick: (ms: number) => { clock += ms; } };
 }
 
@@ -83,6 +93,32 @@ test('does not cache the plaintext password across dials', async () => {
   creds.put('harry@x', 'usagi', 993, 'new-pw');
   await registry.get('harry@x');
   assert.equal(dials[1].pass, 'new-pw');
+});
+
+test('concurrent first use connects only once', async () => {
+  const { registry, dials } = fixture();
+  const [a, b, c] = await Promise.all([
+    registry.get('harry@x'),
+    registry.get('harry@x'),
+    registry.get('harry@x'),
+  ]);
+  assert.equal(dials.length, 1);
+  assert.equal(a, b);
+  assert.equal(b, c);
+});
+
+test('a failed connect is not cached and the next call retries', async () => {
+  const { registry, dials } = fixture({ failFirstConnect: true });
+  await assert.rejects(() => registry.get('harry@x'), /connect refused/);
+  await registry.get('harry@x');
+  assert.equal(dials.length, 2);
+});
+
+test('concurrent calls for different subjects do not share a connection', async () => {
+  const { registry, dials } = fixture();
+  const [harry, dea] = await Promise.all([registry.get('harry@x'), registry.get('dea@x')]);
+  assert.notEqual(harry, dea);
+  assert.deepEqual(dials, [{ user: 'harry@x', pass: 'harry-pw' }, { user: 'dea@x', pass: 'dea-pw' }]);
 });
 
 test('treats a throwing CredentialStore.get as an unusable credential, not an opaque error', async () => {
