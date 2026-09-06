@@ -65,18 +65,32 @@ export async function handleConsent(
   deps: ConsentDeps,
   body: { handle?: string; mailbox?: string; app_password?: string },
 ): Promise<{ redirectTo: string } | { rerender: string }> {
-  const handle = body.handle ?? '';
+  // The declared parameter type is a compile-time shape only -- Node strips
+  // types without checking them at runtime, and a real HTTP request is not
+  // obligated to match it. In particular, a duplicated form field (e.g. two
+  // `handle=` values in an urlencoded POST body) is turned into an ARRAY by
+  // a typical body parser, and nothing stops a caller from sending a number,
+  // null, or an object either. Every field is therefore checked with
+  // `typeof === 'string'` before use; anything else is treated as
+  // absent/invalid and routed through the same `{ rerender }` path already
+  // used for a missing field. This is deliberately NOT "take the first
+  // element of the array" -- a duplicated field is a malformed request, not
+  // a hint about which value to trust.
+  const handle = typeof body.handle === 'string' ? body.handle : '';
 
   // Single-use + expiring: PendingStore.get() itself rejects an expired row,
   // and a handle that has already been consumed was deleted by a prior call
   // to this function -- so both an expired and a replayed handle land here.
+  // A non-string handle also lands here, since it becomes '' above and no
+  // real pending row is ever stored under an empty handle.
   const pending = deps.pending.get(handle);
   if (!pending) {
     return { rerender: renderConsent(handle, 'This authorisation request has expired or was already used. Start again from Claude.') };
   }
 
-  const mailbox = (body.mailbox ?? '').trim().toLowerCase();
-  const appPassword = body.app_password ?? '';
+  const mailboxInput = typeof body.mailbox === 'string' ? body.mailbox : '';
+  const mailbox = mailboxInput.trim().toLowerCase();
+  const appPassword = typeof body.app_password === 'string' ? body.app_password : '';
   if (!mailbox || !appPassword) {
     return { rerender: renderConsent(handle, 'Both fields are required.', mailbox) };
   }

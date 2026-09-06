@@ -120,3 +120,64 @@ test('handleConsent redirects only to the redirect_uri stored with the pending r
   const redirect = new URL((res as any).redirectTo);
   assert.equal(redirect.origin, 'https://claude');
 });
+
+// --- Runtime type validation of body fields ---
+//
+// The `body` parameter's TypeScript type is a compile-time shape only: Node
+// strips types without checking them at runtime, and a real HTTP request is
+// not obligated to match it. Express's urlencoded body parser turns a
+// DUPLICATED form field (e.g. two `handle=` fields) into an array, and a
+// hand-crafted request can hand any of these fields a number, null, or an
+// object. None of that should ever reach `hashToken`, `.trim()`, or the
+// IMAP verifier uncaught -- it must be treated exactly like a missing field
+// and take the existing `{ rerender }` path. These tests bypass the
+// function's declared parameter type with `as any` at the call site (the
+// way a real deserialized request body would arrive), rather than loosening
+// the function's declared type -- the declared type remains the correct
+// contract for callers who honour it.
+
+test('handleConsent returns rerender, not a throw, when handle is submitted as an array (duplicated form field)', async () => {
+  const { deps } = fixture(true);
+  const url = beginConsent(deps, { clientId: 'c1', redirectUri: 'https://claude/cb', codeChallenge: 'chal', state: 'st', resource: undefined, scopes: ['mail'] });
+  const handle = new URL('http://x' + url).searchParams.get('handle')!;
+  const res = await handleConsent(deps, { handle: [handle, handle] as any, mailbox: 'harry@x', app_password: 'good-pw' });
+  assert.ok('rerender' in res);
+});
+
+test('handleConsent returns rerender, not a throw, when mailbox is submitted as an array (duplicated form field)', async () => {
+  const { deps } = fixture(true);
+  const url = beginConsent(deps, { clientId: 'c1', redirectUri: 'https://claude/cb', codeChallenge: 'chal', state: 'st', resource: undefined, scopes: ['mail'] });
+  const handle = new URL('http://x' + url).searchParams.get('handle')!;
+  const res = await handleConsent(deps, { handle, mailbox: ['harry@x', 'evil@x'] as any, app_password: 'good-pw' });
+  assert.ok('rerender' in res);
+});
+
+test('handleConsent returns rerender, not a throw, when app_password is submitted as an array (duplicated form field)', async () => {
+  const { deps } = fixture(true);
+  const url = beginConsent(deps, { clientId: 'c1', redirectUri: 'https://claude/cb', codeChallenge: 'chal', state: 'st', resource: undefined, scopes: ['mail'] });
+  const handle = new URL('http://x' + url).searchParams.get('handle')!;
+  const res = await handleConsent(deps, { handle, mailbox: 'harry@x', app_password: ['good-pw', 'evil-pw'] as any });
+  assert.ok('rerender' in res);
+});
+
+test('handleConsent returns rerender, not a throw, for non-string body fields of other types (number, null, object)', async () => {
+  const { deps } = fixture(true);
+  const url = beginConsent(deps, { clientId: 'c1', redirectUri: 'https://claude/cb', codeChallenge: 'chal', state: 'st', resource: undefined, scopes: ['mail'] });
+  const handle = new URL('http://x' + url).searchParams.get('handle')!;
+
+  const badBodies: any[] = [
+    { handle: 12345, mailbox: 'harry@x', app_password: 'good-pw' },
+    { handle: null, mailbox: 'harry@x', app_password: 'good-pw' },
+    { handle: { toString: () => handle }, mailbox: 'harry@x', app_password: 'good-pw' },
+    { handle, mailbox: 42, app_password: 'good-pw' },
+    { handle, mailbox: null, app_password: 'good-pw' },
+    { handle, mailbox: { evil: true }, app_password: 'good-pw' },
+    { handle, mailbox: 'harry@x', app_password: 42 },
+    { handle, mailbox: 'harry@x', app_password: null },
+    { handle, mailbox: 'harry@x', app_password: { evil: true } },
+  ];
+  for (const body of badBodies) {
+    const res = await handleConsent(deps, body);
+    assert.ok('rerender' in res, `expected rerender for body ${JSON.stringify(body)}`);
+  }
+});
