@@ -5,3 +5,14 @@ accounts.json
 *.local.json
 .worktrees/
 .superpowers/
+
+# Deployment state created by deploy/README.md step 1. The project directory
+# on merbabu is a checkout of this repo, and the runbook creates the AES key
+# and the SQLite database inside it -- so both must be un-committable by
+# construction, not by the operator remembering.
+secrets/
+data/
+deploy/secrets/
+deploy/data/
+*.sqlite
+*.sqlite-*

@@ -1,0 +1,46 @@
+# Build context exclusions.
+#
+# deploy/docker-compose.yml builds with `context: ..`, i.e. this whole
+# repository. The Dockerfile only COPYs package.json, package-lock.json and
+# src/, so nothing else is needed -- and two categories of thing must never
+# be uploadable into a layer at all:
+#
+#   * the AES-GCM key and the SQLite database. The design's stated invariant
+#     is that the key never reaches an image or a build layer. Today no COPY
+#     touches them; this file is what keeps that true if someone later adds
+#     a `COPY . .`.
+#   * .git, which carries the full history (and anything ever committed to
+#     it by mistake) into the build context.
+#
+# Everything else here is just context size and build-cache hygiene.
+
+# Secrets and state -- both possible locations, repo root and deploy/.
+secrets/
+data/
+deploy/secrets/
+deploy/data/
+*.sqlite
+*.sqlite-*
+accounts.json
+*.local.json
+.env
+*.log
+
+# History and dependencies.
+.git
+.gitignore
+.gitattributes
+node_modules/
+
+# Working directories that are not part of the application.
+.superpowers/
+.worktrees/
+docs/
+test/
+scripts/
+README.md
+
+# NOTE: deploy/ itself is deliberately NOT excluded. The compose file builds
+# with `dockerfile: deploy/Dockerfile`, and excluding the directory holding
+# the Dockerfile from its own build context is a needless way to break the
+# build. Only deploy/secrets/ and deploy/data/ are excluded, above.
