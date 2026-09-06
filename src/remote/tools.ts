@@ -4,7 +4,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { listFolders, searchSummaries, fetchEnvelopes, fetchMessageSource, type ImapLike } from '../mailbox.ts';
 import { buildSearchQuery } from '../search.ts';
-import { formatSummary, formatBody } from '../format.ts';
+import { formatSummary, formatBody, sanitizeHeaderValue } from '../format.ts';
 import { TenantRegistry, CredentialUnavailableError } from './tenant-connections.ts';
 import type { CredentialStore } from './store.ts';
 
@@ -169,11 +169,19 @@ export function registerRemoteTools(
       const r = await guard(subject, async () => simpleParser(await fetchMessageSource(await imapFor(subject), folder, uid)));
       if (!r.ok) return text(r.message);
       const p = r.value;
+      // From and Subject are attacker-controlled to the same degree as the
+      // body -- an RFC 2047 encoded-word can decode to raw CR/LF, letting a
+      // crafted header masquerade as several lines of output or forge a
+      // fake "--- BEGIN/END UNTRUSTED EMAIL CONTENT ---" pair. Sanitize
+      // before they are interpolated into a block this tool otherwise
+      // presents as trusted.
+      const fromText = sanitizeHeaderValue(p.from?.text ?? '(unknown sender)');
+      const messageSubject = sanitizeHeaderValue(p.subject || '(no subject)');
       const headers = [
         `Account: ${subject}`,
-        `From: ${p.from?.text ?? '(unknown sender)'}`,
+        `From: ${fromText}`,
         `Date: ${p.date?.toISOString() ?? '(no date)'}`,
-        `Subject: ${p.subject || '(no subject)'}`,
+        `Subject: ${messageSubject}`,
         `Attachments: ${p.attachments.length}`,
       ].join('\n');
       return text(`${headers}\n\n${formatBody(p.text ?? '(no plain text part)', max_chars)}`);
