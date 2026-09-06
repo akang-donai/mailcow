@@ -4,9 +4,24 @@ Operator runbook for running this service on `merbabu` (Debian 12, Docker,
 aaPanel) as `https://mailcp.mizutech.id`. No knowledge of the source is
 assumed beyond what's in this file.
 
-Project directory on the host: `/www/dk_project/dk_app/mailcp/`. Everything
-below assumes commands are run from there (a copy or checkout of this repo,
-with this `deploy/` directory present).
+Project directory on the host: `/www/dk_project/dk_app/mailcp/` -- a copy or
+checkout of this repo, with this `deploy/` directory present.
+
+**Run every command below from `/www/dk_project/dk_app/mailcp/deploy/`.**
+
+```bash
+cd /www/dk_project/dk_app/mailcp/deploy
+```
+
+That is not cosmetic. `docker compose` finds no configuration at the project
+root, because the compose file lives in `deploy/` -- and, more importantly,
+Compose resolves relative bind mounts against the **compose file's**
+directory, never the shell's. So `./data` and `./secrets/key` in
+`docker-compose.yml` always mean `deploy/data` and `deploy/secrets/key`.
+Creating them anywhere else (or invoking the file from elsewhere with `-f`)
+gives you a key in one place and a mount from another; Docker then silently
+creates the missing `deploy/secrets/key` as an empty **directory**, and the
+service dies with `EISDIR` in a restart loop.
 
 Application code deliberately does **not** live under
 `/www/wwwroot/mailcp.mizutech.id` -- that document root exists but is empty
@@ -14,13 +29,38 @@ by design. It has `include enable-php-85.conf`, so if the nginx proxy rule
 in step 3 were ever missing or misconfigured, a document root containing our
 source would serve it directly instead of 404ing. An empty root fails safe.
 
-## 1. Generate the encryption key
+## 1. Generate the encryption key and the data directory
+
+From `deploy/` (see above -- these paths are what the compose file mounts):
 
 ```bash
 mkdir -p data secrets
-chmod 700 data
 head -c 32 /dev/urandom > secrets/key
 chmod 400 secrets/key
+chmod 700 data
+chown -R 1000:1000 data secrets
+```
+
+The `chown` is required, not tidiness. `deploy/Dockerfile` declares
+`USER node`, which in `node:24-alpine` is **uid 1000, gid 1000**. A bind
+mount carries the host's ownership straight through into the container --
+Docker does not adjust it. Left owned by `root` with the modes above, uid
+1000 can neither read `secrets/key` (0400 root) nor write SQLite's
+`mailcp.sqlite-wal` / `-shm` files into `data/` (0700 root), and the
+container restart-loops.
+
+Ownership is fixed on the host rather than with a `user:` override in
+`docker-compose.yml` deliberately: an override that made the container run
+as root would "fix" the permissions by throwing away the non-root container
+hardening that is the point of `USER node` in the first place.
+
+Verify before the first `up` -- `secrets/key` must be a 32-byte **file**,
+not a directory:
+
+```bash
+ls -ln secrets/key data
+stat -c '%n %s bytes %U:%G %a' secrets/key
+# secrets/key 32 bytes 1000:1000 400   (uid/gid may print numerically)
 ```
 
 This is the 256-bit AES-GCM key every stored mailbox app password is
@@ -61,8 +101,8 @@ line. Two independent reasons this matters here, not just general hygiene:
   patches, base image bumps). A digest is the only thing that guarantees
   "the image I tested is the image running in production."
 
-Only once `deploy/Dockerfile` has been edited to reference the pinned
-digest:
+Only once `Dockerfile` has been edited to reference the pinned digest, and
+still from `deploy/`:
 
 ```bash
 docker compose up -d --build
@@ -76,18 +116,58 @@ docker compose logs -f mailcp
 ```
 
 `docker compose ps` should show `healthy` after ~10-40 seconds
-(`start_period` + first probe). The healthcheck hits
-`/.well-known/oauth-authorization-server` on the container's own loopback
-address using `wget` (bundled with Alpine via BusyBox; the image has no
-`curl`). `restart: unless-stopped` only restarts a container that has
-*exited* -- it does nothing for a process that's still running but wedged,
-which is exactly the case this healthcheck exists to catch.
+(`start_period` + first probe). The healthcheck fetches
+`/.well-known/oauth-authorization-server` with `wget` (bundled with Alpine
+via BusyBox; the image has no `curl`) against the container's own **bridge**
+address (`hostname -i`), not `127.0.0.1` -- see the next section for why
+that distinction is load-bearing. `restart: unless-stopped` only restarts a
+container that has *exited*; it does nothing for a process that's still
+running but wedged, which is exactly the case this healthcheck exists to
+catch.
+
+Then prove it end to end from the host, through the published port, which
+is the path nginx actually uses:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8787/.well-known/oauth-authorization-server
+# 200
+```
+
+A `curl: (7) Failed to connect` here with the container reporting `healthy`
+is the signature of the bind-address mistake described below.
+
+### Bind address vs published port -- do not "fix" `BIND_ADDR` back
+
+These are two different controls and confusing them shipped this service
+completely unreachable once already:
+
+| | what it does | value here |
+|---|---|---|
+| `ports: "127.0.0.1:8787:8787"` | which **host** interface the port is published on. This is the isolation control -- nothing on `192.168.57.0/24` can reach it, so nginx stays the only way in. | loopback |
+| `BIND_ADDR` | which interface the Node listener attaches to **inside the container's own network namespace** | `0.0.0.0` |
+
+Docker's default bridge networking DNATs a published port to the
+container's *bridge* address (`172.x.y.z`). A listener bound to the
+container's own `127.0.0.1` is therefore unreachable through that mapping:
+nginx gets connection-refused on every single request. Worse, an in-
+container healthcheck aimed at `127.0.0.1` still succeeds, so
+`docker compose ps` reports **healthy** while the service is 100% down.
+That is why the probe targets `hostname -i` instead.
+
+`BIND_ADDR=0.0.0.0` inside the container does **not** widen exposure: the
+only route in from outside the container's namespace is the port mapping,
+and that mapping is pinned to the host's loopback. `BIND_ADDR` defaults to
+`127.0.0.1` in `src/remote/env.ts` so a bare-metal run (`npm run
+start:remote`, no container, no port mapping) is still loopback-only
+without any configuration.
 
 ### Why `read_only: true` works with a SQLite database
 
 The compose file sets `read_only: true` on the container's root filesystem.
 The two things this process needs to write both land outside that root:
-`/tmp` (a tmpfs mount) and `/var/lib/mailcp` (the `./data` bind mount).
+`/tmp` (a tmpfs mount) and `/var/lib/mailcp` (the `deploy/data` bind mount,
+written as `./data` in the compose file).
 `node:sqlite` opens the database in WAL mode
 (`PRAGMA journal_mode=WAL` in `src/remote/db.ts`), which writes two
 additional files alongside the main one -- `mailcp.sqlite-wal` and
@@ -238,6 +318,8 @@ admin credential to use the connector.
 
 ## 6. Rollback
 
+From `deploy/`:
+
 ```bash
 docker compose down
 ```
@@ -251,8 +333,8 @@ nginx -t && nginx -s reload
 
 Also remove the `limit_req_zone` lines added to the main `nginx.conf` in
 step 3 if nothing else on the host uses those zone names (they're harmless
-to leave, but there's no reason to keep dead config). `data/` and
-`secrets/key` are left untouched by this rollback -- delete them yourself
+to leave, but there's no reason to keep dead config). `deploy/data/` and
+`deploy/secrets/key` are left untouched by this rollback -- delete them yourself
 only if you intend this to be permanent and understand that doing so
 destroys every stored credential (see step 1).
 
@@ -268,7 +350,7 @@ everything else on the box.
 
 It does **not** work in the other direction. A compromise of any of those
 other 38 sites, or of MySQL/PostgreSQL/PHP/aaPanel, lands on a host that
-can read `secrets/key` and `data/mailcp.sqlite` directly off disk as root
+can read `deploy/secrets/key` and `deploy/data/mailcp.sqlite` directly off disk as root
 (or as any user with access equivalent to root) -- Docker's isolation is
 irrelevant at that point, because the attacker isn't going through the
 container at all. If that isolation matters more than the convenience of
