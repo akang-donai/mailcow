@@ -1,4 +1,7 @@
-export type Config = {
+import { readFileSync, statSync } from 'node:fs';
+
+export type Account = {
+  name: string;
   host: string;
   port: number;
   user: string;
@@ -8,24 +11,90 @@ export type Config = {
 /** Ports that speak cleartext IMAP/POP3. This server only does implicit TLS. */
 const PLAINTEXT_PORTS = new Set([110, 143]);
 
-function required(env: Record<string, string | undefined>, name: string): string {
-  const value = env[name];
-  if (!value) throw new Error(`${name} is required`);
+const DEFAULT_PORT = 993;
+
+function requireString(
+  account: Record<string, unknown>,
+  name: string,
+  field: string,
+): string {
+  const value = account[field];
+  if (typeof value !== 'string' || value === '') {
+    throw new Error(`account "${name}" is missing ${field}`);
+  }
   return value;
 }
 
-export function loadConfig(env: Record<string, string | undefined>): Config {
-  const host = required(env, 'MAILCOW_IMAP_HOST');
-  const user = required(env, 'MAILCOW_IMAP_USER');
-  const password = required(env, 'MAILCOW_IMAP_PASSWORD');
+function resolvePort(account: Record<string, unknown>, name: string): number {
+  if (account.port === undefined) return DEFAULT_PORT;
 
-  const port = env.MAILCOW_IMAP_PORT ? Number(env.MAILCOW_IMAP_PORT) : 993;
+  const port = Number(account.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`MAILCOW_IMAP_PORT is not a valid port: ${env.MAILCOW_IMAP_PORT}`);
+    throw new Error(`account "${name}" has an invalid port: ${account.port}`);
   }
   if (PLAINTEXT_PORTS.has(port)) {
-    throw new Error(`port ${port} is cleartext; this server requires implicit TLS (993)`);
+    throw new Error(`account "${name}" uses cleartext port ${port}; implicit TLS is required`);
+  }
+  return port;
+}
+
+export function parseAccounts(raw: unknown): Account[] {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new Error('accounts file must contain a JSON object');
   }
 
-  return { host, port, user, password };
+  const accounts = (raw as Record<string, unknown>).accounts;
+  if (typeof accounts !== 'object' || accounts === null || Array.isArray(accounts)) {
+    throw new Error('accounts file must contain an "accounts" object');
+  }
+
+  const entries = Object.entries(accounts as Record<string, unknown>);
+  if (entries.length === 0) {
+    throw new Error('accounts file must define at least one account');
+  }
+
+  return entries.map(([name, value]) => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error(`account "${name}" must be an object`);
+    }
+    const account = value as Record<string, unknown>;
+    return {
+      name,
+      host: requireString(account, name, 'host'),
+      port: resolvePort(account, name),
+      user: requireString(account, name, 'user'),
+      password: requireString(account, name, 'password'),
+    };
+  });
+}
+
+/**
+ * Refuse a credentials file that anyone but its owner can read.
+ *
+ * The file holds app passwords in cleartext, so loose permissions are a
+ * startup error rather than a warning nobody reads.
+ */
+export function assertSecureMode(mode: number, path: string): void {
+  const permissions = mode & 0o777;
+  if (permissions & 0o077) {
+    const octal = permissions.toString(8).padStart(3, '0');
+    throw new Error(
+      `${path} has permissions 0${octal}; it holds passwords and must be 0600 (chmod 600 ${path})`,
+    );
+  }
+}
+
+export function loadAccounts(env: Record<string, string | undefined>): Account[] {
+  const path = env.MAILCOW_ACCOUNTS_FILE;
+  if (!path) throw new Error('MAILCOW_ACCOUNTS_FILE is required');
+
+  assertSecureMode(statSync(path).mode, path);
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    throw new Error(`${path} is not valid JSON: ${(err as Error).message}`);
+  }
+  return parseAccounts(raw);
 }

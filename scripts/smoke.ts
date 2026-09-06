@@ -1,33 +1,50 @@
 /**
- * Live end-to-end check against the real mailbox.
- * Usage: set the MAILCOW_IMAP_* env vars, then `node scripts/smoke.ts`
+ * Live check against the real server.
+ *   node scripts/smoke.ts            # every configured account
+ *   node scripts/smoke.ts harry      # one account
  */
 import { ImapFlow } from 'imapflow';
-import { loadConfig } from '../src/config.ts';
+import { loadAccounts } from '../src/config.ts';
 import { listFolders, searchSummaries, fetchEnvelopes, type ImapLike } from '../src/mailbox.ts';
 import { formatSummary } from '../src/format.ts';
 
-const config = loadConfig(process.env);
-const client = new ImapFlow({
-  host: config.host,
-  port: config.port,
-  secure: true,
-  auth: { user: config.user, pass: config.password },
-  logger: false,
-});
+const wanted = process.argv[2];
+const accounts = loadAccounts(process.env).filter((a) => !wanted || a.name === wanted);
 
-await client.connect();
-console.log(`connected: ${config.user} via ${config.host}:${config.port}`);
+if (accounts.length === 0) {
+  console.error(`no account named "${wanted}"`);
+  process.exit(1);
+}
 
-const imap = client as unknown as ImapLike;
+let failed = 0;
 
-const folders = await listFolders(imap);
-console.log(`folders (${folders.length}): ${folders.join(', ')}`);
+for (const account of accounts) {
+  const client = new ImapFlow({
+    host: account.host,
+    port: account.port,
+    secure: true,
+    auth: { user: account.user, pass: account.password },
+    logger: false,
+  });
 
-const uids = await searchSummaries(imap, 'INBOX', { all: true }, 3);
-const messages = await fetchEnvelopes(imap, 'INBOX', uids);
-console.log(`newest ${messages.length} in INBOX:`);
-for (const m of messages) console.log('  ' + formatSummary(m.uid, m.envelope as never));
+  try {
+    await client.connect();
+    console.log(`\n${account.name}: connected as ${account.user} via ${account.host}:${account.port}`);
 
-await client.logout();
-console.log('OK');
+    const imap = client as unknown as ImapLike;
+    const folders = await listFolders(imap);
+    console.log(`${account.name}: ${folders.length} folders — ${folders.join(', ')}`);
+
+    const uids = await searchSummaries(imap, 'INBOX', { all: true }, 3);
+    for (const m of await fetchEnvelopes(imap, 'INBOX', uids)) {
+      console.log('  ' + formatSummary(account.name, m.uid, m.envelope as never));
+    }
+    await client.logout();
+  } catch (err) {
+    failed += 1;
+    console.error(`${account.name}: FAILED — ${(err as Error).message}`);
+  }
+}
+
+console.log(failed === 0 ? '\nOK' : `\n${failed} account(s) failed`);
+process.exit(failed === 0 ? 0 : 1);

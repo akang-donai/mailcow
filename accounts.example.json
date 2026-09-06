@@ -1,0 +1,15 @@
+{
+  "accounts": {
+    "harry": {
+      "host": "usagi.mizutech.id",
+      "user": "harry@mizutech.id",
+      "password": "REPLACE-WITH-APP-PASSWORD"
+    },
+    "admin": {
+      "host": "usagi.mizutech.id",
+      "port": 993,
+      "user": "admin@mizutech.id",
+      "password": "REPLACE-WITH-APP-PASSWORD"
+    }
+  }
+}

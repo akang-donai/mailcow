@@ -7,11 +7,17 @@ export type Envelope = {
 const BEGIN_MARKER = '--- BEGIN UNTRUSTED EMAIL CONTENT ---';
 const END_MARKER = '--- END UNTRUSTED EMAIL CONTENT ---';
 
-export function formatSummary(uid: number, envelope: Envelope): string {
+/**
+ * One summary line, led by the account it came from.
+ *
+ * With several mailboxes configured the account is the only thing separating
+ * two otherwise identical lines, so it is never omitted.
+ */
+export function formatSummary(account: string, uid: number, envelope: Envelope): string {
   const date = envelope.date ? envelope.date.toISOString().slice(0, 10) : '(no date)';
   const sender = envelope.from?.[0]?.address ?? '(unknown sender)';
   const subject = envelope.subject || '(no subject)';
-  return `[${uid}] ${date}  ${sender}  ${subject}`;
+  return `${account} [${uid}] ${date}  ${sender}  ${subject}`;
 }
 
 /**
