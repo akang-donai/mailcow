@@ -54,8 +54,24 @@ export function openDb(path: string): DatabaseSync {
       state TEXT,
       resource TEXT,
       scopes TEXT,
-      expires_at INTEGER NOT NULL
+      expires_at INTEGER NOT NULL,
+      browser_token_hash TEXT
     );
   `);
+
+  // CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+  // so a database created before the consent browser-binding landed would
+  // reach the INSERT in PendingStore.save with no such column and crash on
+  // every /authorize. Pending rows are ephemeral (10 min TTL), so adding
+  // the column nullable is a complete migration; consent.ts treats a null
+  // as "no match", which fails closed for any row already in flight.
+  ensureColumn(db, 'pending_authorizations', 'browser_token_hash', 'TEXT');
+
   return db;
+}
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, decl: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (columns.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
 }

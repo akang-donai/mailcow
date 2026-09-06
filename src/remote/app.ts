@@ -12,10 +12,10 @@ import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelconte
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { OAuthError, ServerError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { MailcowOAuthProvider } from './provider.ts';
-import type { SqliteClientsStore, PendingStore, CredentialStore } from './store.ts';
+import type { SqliteClientsStore, PendingStore, CredentialStore, TokenStore } from './store.ts';
 import type { TenantRegistry } from './tenant-connections.ts';
 import type { ImapVerifier } from './verify.ts';
-import { renderConsent, handleConsent } from './consent.ts';
+import { renderConsent, handleConsent, consentView, readConsentCookie } from './consent.ts';
 import { registerRemoteTools } from './tools.ts';
 
 export type AppDeps = {
@@ -23,6 +23,7 @@ export type AppDeps = {
   clientsStore: SqliteClientsStore;
   pending: PendingStore;
   credentials: CredentialStore;
+  tokens: TokenStore;
   registry: TenantRegistry;
   verify: ImapVerifier;
   issuerUrl: URL;
@@ -33,9 +34,17 @@ export type AppDeps = {
 // A framable OAuth consent screen is a clickjacking target: an attacker
 // could overlay it and harvest a visitor's mailbox app password. Applied to
 // both the GET (form) and POST (redirect/re-render) consent responses.
+//
+// no-store covers both directions: the GET carries the pending handle and,
+// after a failed attempt, the mailbox the visitor typed; the POST's 302
+// carries a live authorization code in its Location header. Neither belongs
+// in a shared cache, a proxy, or the browser's back/forward cache. The SDK
+// sets this itself on /authorize and /token -- these two routes are ours,
+// and were the gap.
 function setConsentSecurityHeaders(res: express.Response): void {
   res.set('X-Frame-Options', 'DENY');
   res.set('Content-Security-Policy', "default-src 'none'; form-action 'self'; style-src 'unsafe-inline'");
+  res.set('Cache-Control', 'no-store');
 }
 
 // Terminal error handler -- Express identifies this as error-handling
@@ -114,6 +123,7 @@ export function buildApp(deps: AppDeps): Express {
     credentials: deps.credentials,
     provider: deps.provider,
     clientsStore: deps.clientsStore,
+    tokens: deps.tokens,
     verify: deps.verify,
     imapHost: deps.imapHost,
     imapPort: deps.imapPort,
@@ -150,14 +160,20 @@ export function buildApp(deps: AppDeps): Express {
   app.get('/consent', (req, res) => {
     const handle = typeof req.query.handle === 'string' ? req.query.handle : '';
     setConsentSecurityHeaders(res);
-    res.type('html').send(renderConsent(handle));
+    // consentView resolves the requesting client's name and the origin the
+    // browser will be sent to from the pending row, so the page can say who
+    // is actually asking instead of asserting a vendor name.
+    res.type('html').send(renderConsent(consentView(consentDeps, handle)));
   });
 
   app.post('/consent', express.urlencoded({ extended: false }), async (req, res) => {
     // handleConsent validates the shape of every field itself (a duplicated
     // form field, or a non-string value, is treated as absent/invalid) --
     // req.body is passed straight through with no duplicate checking here.
-    const result = await handleConsent(consentDeps, req.body);
+    // The cookie is read from the raw header rather than via cookie-parser:
+    // one path-scoped cookie does not justify another dependency in an
+    // internet-facing process.
+    const result = await handleConsent(consentDeps, req.body, readConsentCookie(req.headers.cookie), res);
     setConsentSecurityHeaders(res);
     if ('redirectTo' in result) {
       res.redirect(result.redirectTo);

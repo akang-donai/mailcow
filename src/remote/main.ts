@@ -76,6 +76,7 @@ function main(): void {
     credentials,
     provider,
     clientsStore,
+    tokens,
     verify,
     imapHost: cfg.imapHost,
     imapPort: cfg.imapPort,
@@ -88,8 +89,10 @@ function main(): void {
   // to prove an app password before a code is ever issued, so this sends
   // them into the consent flow instead of minting one directly.
   provider.setOnAuthorize((client, params, res) => {
+    // beginConsent sets the browser-binding cookie on `res` as well as
+    // returning the location, so the two cannot drift apart.
     res.redirect(
-      beginConsent(consentDeps, {
+      beginConsent(consentDeps, res, {
         clientId: client.client_id,
         redirectUri: params.redirectUri,
         codeChallenge: params.codeChallenge,
@@ -105,6 +108,7 @@ function main(): void {
     clientsStore,
     pending,
     credentials,
+    tokens,
     registry,
     verify,
     issuerUrl: cfg.issuerUrl,

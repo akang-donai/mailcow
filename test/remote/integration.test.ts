@@ -147,18 +147,19 @@ before(async () => {
   const clientsStore = new SqliteClientsStore(db);
   const credentials = new CredentialStore(db, randomBytes(32));
   const pending = new PendingStore(db);
+  const tokens = new TokenStore(db);
   const provider = new MailcowOAuthProvider({
     clientsStore,
     codes: new CodeStore(db),
-    tokens: new TokenStore(db),
+    tokens,
     ttls: { code: 60, access: 3600, refresh: 2592000 },
   });
   const registry = new TenantRegistry({ credentials, connector: fakeFactory });
   const issuerUrl = new URL('http://127.0.0.1');
-  const consentDeps = { pending, credentials, provider, clientsStore, verify, imapHost: 'usagi', imapPort: 993 };
+  const consentDeps = { pending, credentials, provider, clientsStore, tokens, verify, imapHost: 'usagi', imapPort: 993 };
   provider.setOnAuthorize((client, params, res) =>
     res.redirect(
-      beginConsent(consentDeps, {
+      beginConsent(consentDeps, res, {
         clientId: client.client_id,
         redirectUri: params.redirectUri,
         codeChallenge: params.codeChallenge,
@@ -168,7 +169,7 @@ before(async () => {
       }),
     ),
   );
-  const app = buildApp({ provider, clientsStore, pending, credentials, registry, verify, issuerUrl, imapHost: 'usagi', imapPort: 993 });
+  const app = buildApp({ provider, clientsStore, pending, credentials, tokens, registry, verify, issuerUrl, imapHost: 'usagi', imapPort: 993 });
   await new Promise<void>((resolve) => {
     server = app.listen(0, '127.0.0.1', resolve);
   });
@@ -179,7 +180,9 @@ after(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-async function registerClient(): Promise<{ client_id: string }> {
+async function registerClient(
+  overrides: { client_name?: string; redirect_uris?: string[] } = {},
+): Promise<{ client_id: string }> {
   const res = await fetch(`${base}/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -188,6 +191,7 @@ async function registerClient(): Promise<{ client_id: string }> {
       redirect_uris: ['https://claude/cb'],
       grant_types: ['authorization_code', 'refresh_token'],
       token_endpoint_auth_method: 'none',
+      ...overrides,
     }),
   });
   return (await res.json()) as { client_id: string };
@@ -195,26 +199,45 @@ async function registerClient(): Promise<{ client_id: string }> {
 
 type Enrolment = { access_token: string; refresh_token: string; client_id: string };
 
+// The consent flow is bound to the browser that started it: /authorize sets
+// an HttpOnly, path-scoped cookie and POST /consent requires it back. These
+// helpers do what a browser does -- keep the Set-Cookie from /authorize and
+// replay it -- so the enrolment path exercises the binding rather than
+// bypassing it.
+function cookieHeaderFrom(res: Response): string {
+  const setCookie = res.headers.getSetCookie?.() ?? [];
+  return setCookie.map((c) => c.split(';')[0]!).join('; ');
+}
+
+type Started = { handle: string; cookie: string; verifier: string; clientId: string };
+
+async function startAuthorize(clientId: string, redirectUri = 'https://claude/cb'): Promise<Started> {
+  const { verifier, challenge } = pkce();
+  const authRes = await fetch(
+    `${base}/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&code_challenge=${challenge}&code_challenge_method=S256&state=st`,
+    { redirect: 'manual' },
+  );
+  assert.ok(authRes.headers.get('location'), 'authorize must redirect to the consent screen');
+  const handle = new URL(authRes.headers.get('location')!, base).searchParams.get('handle')!;
+  return { handle, cookie: cookieHeaderFrom(authRes), verifier, clientId };
+}
+
+function postConsent(handle: string, mailbox: string, cookie: string, password = 'good-pw'): Promise<Response> {
+  return fetch(`${base}/consent`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...(cookie ? { cookie } : {}) },
+    body: new URLSearchParams({ handle, mailbox, app_password: password }),
+  });
+}
+
 // Runs one full enrolment (DCR -> authorize -> consent -> token exchange)
 // and returns the resulting token pair.
 async function enrol(mailbox: string): Promise<Enrolment> {
   const reg = await registerClient();
-  const { verifier, challenge } = pkce();
+  const { handle, cookie, verifier } = await startAuthorize(reg.client_id);
 
-  const authRes = await fetch(
-    `${base}/authorize?response_type=code&client_id=${reg.client_id}&redirect_uri=${encodeURIComponent('https://claude/cb')}&code_challenge=${challenge}&code_challenge_method=S256&state=st`,
-    { redirect: 'manual' },
-  );
-  assert.ok(authRes.headers.get('location'), 'authorize must redirect to the consent screen');
-  const consentUrl = new URL(authRes.headers.get('location')!, base);
-  const handle = consentUrl.searchParams.get('handle')!;
-
-  const consentRes = await fetch(`${base}/consent`, {
-    method: 'POST',
-    redirect: 'manual',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ handle, mailbox, app_password: 'good-pw' }),
-  });
+  const consentRes = await postConsent(handle, mailbox, cookie);
   assert.ok(consentRes.headers.get('location'), 'consent POST must redirect back to the client with a code');
   const cb = new URL(consentRes.headers.get('location')!);
   const code = cb.searchParams.get('code')!;
@@ -393,18 +416,8 @@ test('a hostile tool argument cannot steer search_messages to another subject\'s
 
 test('token exchange with a wrong PKCE verifier is rejected', async () => {
   const reg = await registerClient();
-  const { challenge } = pkce();
-  const authRes = await fetch(
-    `${base}/authorize?response_type=code&client_id=${reg.client_id}&redirect_uri=${encodeURIComponent('https://claude/cb')}&code_challenge=${challenge}&code_challenge_method=S256`,
-    { redirect: 'manual' },
-  );
-  const handle = new URL(authRes.headers.get('location')!, base).searchParams.get('handle')!;
-  const consentRes = await fetch(`${base}/consent`, {
-    method: 'POST',
-    redirect: 'manual',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ handle, mailbox: 'harry@x', app_password: 'good-pw' }),
-  });
+  const { handle, cookie } = await startAuthorize(reg.client_id);
+  const consentRes = await postConsent(handle, 'harry@x', cookie);
   const code = new URL(consentRes.headers.get('location')!).searchParams.get('code')!;
 
   const tok = await fetch(`${base}/token`, {
@@ -467,4 +480,71 @@ test('replaying a consumed refresh token kills the whole chain, including the to
   // ...and so must the refresh token from that same rotation.
   const secondRefresh = await refreshToken(t2.refresh_token, t1.client_id);
   assert.equal(secondRefresh.status, 400);
+});
+
+
+// ---------------------------------------------------------------------------
+// 6. The rogue-client phish, end to end over real HTTP.
+//
+// Dynamic client registration is open by specification: anyone can register
+// a client with any client_name and any redirect_uri. The consent screen is
+// therefore the only thing between that and a stranger's mailbox. This
+// reproduces the exact sequence a reviewer ran successfully against the
+// running app -- register with redirect_uri=https://evil.example/cb, drive
+// /authorize, hand the victim the consent link -- and asserts each of the
+// three properties that now stop it.
+// ---------------------------------------------------------------------------
+
+test('the consent page identifies the actual requesting client and its redirect origin, and claims no vendor', async () => {
+  const rogue = await registerClient({ client_name: 'Mailbox Assistant', redirect_uris: ['https://evil.example/cb'] });
+  const { handle } = await startAuthorize(rogue.client_id, 'https://evil.example/cb');
+
+  const page = await fetch(`${base}/consent?handle=${encodeURIComponent(handle)}`);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+
+  assert.ok(html.includes('Mailbox Assistant'), 'the page must name the client that actually asked');
+  assert.ok(html.includes('https://evil.example'), 'the page must show where the browser will be sent');
+  assert.ok(!html.includes('Claude'), 'the page must not assert a vendor the request never mentioned');
+});
+
+test('an attacker cannot complete their own /authorize in a victim\'s browser', async () => {
+  const rogue = await registerClient({ client_name: 'Mailbox Assistant', redirect_uris: ['https://evil.example/cb'] });
+  // The attacker runs /authorize; the cookie lands in THEIR browser and is
+  // deliberately not forwarded to the victim.
+  const { handle } = await startAuthorize(rogue.client_id, 'https://evil.example/cb');
+
+  const victimSubmit = await postConsent(handle, 'harry@x', '');
+
+  assert.equal(victimSubmit.status, 200, 'expected the form back, not a 302 to the attacker');
+  assert.equal(victimSubmit.headers.get('location'), null, 'no code may be issued to the attacker\'s redirect_uri');
+  const body = await victimSubmit.text();
+  assert.ok(/not started in this browser/i.test(body));
+});
+
+test('a fresh consent for a mailbox invalidates a token issued to a different client for that mailbox', async () => {
+  // Stand in for the attacker's foothold: a real, working token bound to
+  // harry@x, obtained through a complete legitimate flow of its own.
+  const attacker = await enrol('harry@x');
+  assert.equal((await callTool(attacker.access_token, 'current_mailbox')).status, 200);
+
+  // Harry notices and re-adds the connector -- the recovery step a user can
+  // actually perform without touching mailcow.
+  const recovered = await enrol('harry@x');
+
+  assert.equal((await callTool(attacker.access_token, 'current_mailbox')).status, 401, "the attacker's access token must be dead");
+  assert.equal((await refreshToken(attacker.refresh_token, attacker.client_id)).status, 400, '...and it must not be able to rotate itself back');
+  assert.equal((await callTool(recovered.access_token, 'current_mailbox')).status, 200, "harry's new token must work");
+});
+
+test('the consent GET and the 302 carrying the authorization code are both no-store', async () => {
+  const reg = await registerClient();
+  const { handle, cookie } = await startAuthorize(reg.client_id);
+
+  const page = await fetch(`${base}/consent?handle=${encodeURIComponent(handle)}`);
+  assert.match(page.headers.get('cache-control') ?? '', /no-store/);
+
+  const done = await postConsent(handle, 'harry@x', cookie);
+  assert.ok(done.headers.get('location')?.includes('code='));
+  assert.match(done.headers.get('cache-control') ?? '', /no-store/, 'a 302 carrying a live code must not be cacheable');
 });

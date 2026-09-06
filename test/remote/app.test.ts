@@ -31,10 +31,10 @@ function fixture() {
   const verify = async () => true;
   const provider = new MailcowOAuthProvider({ clientsStore, codes, tokens, ttls: { code: 60, access: 3600, refresh: 2592000 } });
 
-  const consentDeps = { pending, credentials, provider, clientsStore, verify, imapHost: 'usagi', imapPort: 993 };
+  const consentDeps = { pending, credentials, provider, clientsStore, tokens, verify, imapHost: 'usagi', imapPort: 993 };
   provider.setOnAuthorize((client, params, res) => {
     res.redirect(
-      beginConsent(consentDeps, {
+      beginConsent(consentDeps, res, {
         clientId: client.client_id,
         redirectUri: params.redirectUri,
         codeChallenge: params.codeChallenge,
@@ -46,7 +46,7 @@ function fixture() {
   });
 
   const issuerUrl = new URL('https://example.test');
-  const app = buildApp({ provider, clientsStore, pending, credentials, registry, verify, issuerUrl, imapHost: 'usagi', imapPort: 993 });
+  const app = buildApp({ provider, clientsStore, pending, credentials, tokens, registry, verify, issuerUrl, imapHost: 'usagi', imapPort: 993 });
   return { app, clientsStore };
 }
 

@@ -120,6 +120,15 @@ export class TokenStore {
     this.#db.prepare('update tokens set revoked_at=? where subject=? and client_id=? and revoked_at is null').run(nowSec(), subject, clientId);
   }
 
+  // Every live token for a mailbox, across every client. Used when a subject
+  // completes a fresh consent: that is the mailbox owner re-stating who may
+  // read their mail, so anything issued earlier -- including a token some
+  // other client holds -- stops working. revokeChainBySubjectClient is the
+  // narrower theft-response tool and is deliberately kept separate.
+  revokeAllBySubject(subject: string): void {
+    this.#db.prepare('update tokens set revoked_at=? where subject=? and revoked_at is null').run(nowSec(), subject);
+  }
+
   // Resolves subject+client+kind for a token hash even when it is consumed or
   // revoked (unlike verify(), which treats those as absent). This is how a
   // replayed refresh token is traced back to the chain that must be revoked, and
@@ -178,13 +187,17 @@ export class PendingStore {
   #db: DatabaseSync;
   constructor(db: DatabaseSync) { this.#db = db; }
 
-  save(handle: string, d: PendingData & { ttlSec: number }): void {
+  // browserToken is the second half of the consent binding (see
+  // consent.ts): the handle travels in a URL, this one only ever in a
+  // path-scoped HttpOnly cookie. Stored hashed for the same reason the
+  // handle is -- both are bearer values.
+  save(handle: string, d: PendingData & { browserToken: string; ttlSec: number }): void {
     this.#db.prepare(
-      'insert into pending_authorizations(handle_hash,client_id,redirect_uri,code_challenge,state,resource,scopes,expires_at) values (?,?,?,?,?,?,?,?)'
-    ).run(hashToken(handle), d.clientId, d.redirectUri, d.codeChallenge, d.state ?? null, d.resource ?? null, (d.scopes ?? []).join(' '), nowSec() + d.ttlSec);
+      'insert into pending_authorizations(handle_hash,client_id,redirect_uri,code_challenge,state,resource,scopes,expires_at,browser_token_hash) values (?,?,?,?,?,?,?,?,?)'
+    ).run(hashToken(handle), d.clientId, d.redirectUri, d.codeChallenge, d.state ?? null, d.resource ?? null, (d.scopes ?? []).join(' '), nowSec() + d.ttlSec, hashToken(d.browserToken));
   }
 
-  get(handle: string): (PendingData & { scopes: string[] }) | null {
+  get(handle: string): (PendingData & { scopes: string[]; browserTokenHash: string | null }) | null {
     const row: any = this.#db.prepare('select * from pending_authorizations where handle_hash=?').get(hashToken(handle));
     if (!row || row.expires_at < nowSec()) return null;
     return {
@@ -194,6 +207,9 @@ export class PendingStore {
       state: row.state ?? undefined,
       resource: row.resource ?? undefined,
       scopes: row.scopes ? row.scopes.split(' ') : [],
+      // Null only for a row written before the binding existed. The caller
+      // treats that as "no match", which fails closed.
+      browserTokenHash: row.browser_token_hash ?? null,
     };
   }
 

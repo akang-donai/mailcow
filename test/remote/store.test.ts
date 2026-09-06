@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { openDb } from '../../src/remote/db.ts';
 import { SqliteClientsStore, CodeStore, TokenStore, CredentialStore, PendingStore } from '../../src/remote/store.ts';
+import { hashToken } from '../../src/remote/crypto.ts';
 
 const key = randomBytes(32);
 const now = () => Math.floor(Date.now() / 1000);
@@ -187,9 +188,10 @@ test('markConsumed is single-use: the second call loses the race', () => {
 
 test('pending store round-trips a saved handle', () => {
   const ps = new PendingStore(openDb(':memory:'));
-  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', state: 'st', resource: 'res', scopes: ['mail'], ttlSec: 600 });
+  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', state: 'st', resource: 'res', scopes: ['mail'], browserToken: 'b1', ttlSec: 600 });
   assert.deepEqual(ps.get('h1'), {
     clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', state: 'st', resource: 'res', scopes: ['mail'],
+    browserTokenHash: hashToken('b1'),
   });
 });
 
@@ -200,13 +202,13 @@ test('pending store get returns null for an unknown handle', () => {
 
 test('pending store get returns null for an expired handle', () => {
   const ps = new PendingStore(openDb(':memory:'));
-  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', ttlSec: -1 });
+  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', browserToken: 'b1', ttlSec: -1 });
   assert.equal(ps.get('h1'), null);
 });
 
 test('pending store delete removes the row so a subsequent get is null', () => {
   const ps = new PendingStore(openDb(':memory:'));
-  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', ttlSec: 600 });
+  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', browserToken: 'b1', ttlSec: 600 });
   ps.delete('h1');
   assert.equal(ps.get('h1'), null);
 });
@@ -215,8 +217,31 @@ test('pending store persists the handle hashed, never in the clear', () => {
   const db = openDb(':memory:');
   const ps = new PendingStore(db);
   const handle = 'raw-handle-should-never-appear-in-storage';
-  ps.save(handle, { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', ttlSec: 600 });
+  ps.save(handle, { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', browserToken: 'b1', ttlSec: 600 });
   const row: any = db.prepare('select * from pending_authorizations').get();
   assert.notEqual(row.handle_hash, handle);
   assert.ok(!JSON.stringify(row).includes(handle));
+});
+
+test('revokeAllBySubject kills every live token for a mailbox across all clients', () => {
+  const tokens = new TokenStore(openDb(':memory:'));
+  const a = tokens.issue({ kind: 'access', clientId: 'c1', subject: 'harry@x', scope: 'mail', ttlSec: 3600 });
+  const r = tokens.issue({ kind: 'refresh', clientId: 'c2', subject: 'harry@x', scope: 'mail', ttlSec: 3600 });
+  const other = tokens.issue({ kind: 'access', clientId: 'c1', subject: 'dea@x', scope: 'mail', ttlSec: 3600 });
+
+  tokens.revokeAllBySubject('harry@x');
+
+  assert.equal(tokens.verify(a, 'access'), null);
+  assert.equal(tokens.verify(r, 'refresh'), null, 'a token held by a DIFFERENT client for the same mailbox must die too');
+  assert.ok(tokens.verify(other, 'access'), 'another mailbox is untouched');
+});
+
+test('the pending-authorizations browser token is stored hashed, never in the clear', () => {
+  const db = openDb(':memory:');
+  const ps = new PendingStore(db);
+  const secret = 'raw-browser-token-should-never-appear-in-storage';
+  ps.save('h1', { clientId: 'c1', redirectUri: 'https://x/cb', codeChallenge: 'chal', browserToken: secret, ttlSec: 600 });
+  const row: any = db.prepare('select * from pending_authorizations').get();
+  assert.equal(row.browser_token_hash, hashToken(secret));
+  assert.ok(!JSON.stringify(row).includes(secret));
 });

@@ -2,15 +2,36 @@
 //
 // The consent page is the gate that turns "someone completed an OAuth dance"
 // into "someone proved they control this mailbox". It renders attacker-
-// influenceable values (the handle echoed from the query/form, and the
-// mailbox the visitor typed) into HTML, so every interpolated value MUST be
-// escaped -- including inside attribute contexts, where an unescaped quote
-// character would let a value break out of value="...". The app password is
-// never interpolated anywhere, including on the error re-render path: if a
-// mistyped password causes the form to come back, the password field is
-// rendered empty.
-import { randomToken } from './crypto.ts';
-import type { PendingStore, CredentialStore, SqliteClientsStore } from './store.ts';
+// influenceable values (the handle echoed from the query/form, the mailbox
+// the visitor typed, and -- since dynamic client registration is open by
+// design -- the requesting client's own name and redirect URI) into HTML,
+// so every interpolated value MUST be escaped, including inside attribute
+// contexts where an unescaped quote would let a value break out of
+// value="...". The app password is never interpolated anywhere, including
+// on the error re-render path: if a mistyped password causes the form to
+// come back, the password field is rendered empty.
+//
+// Two properties beyond escaping matter here, because the page is the only
+// thing standing between a rogue client and a victim's mailbox:
+//
+//   1. IDENTIFICATION. Anyone can register a client (that is what DCR is)
+//      and choose its client_name and redirect_uri. The page therefore
+//      names the actual requesting client and, prominently, the origin the
+//      browser will be sent to afterwards -- the one part of a registration
+//      an attacker cannot forge into looking like somebody else. It must
+//      not claim the request came from "Claude"; it previously did, on a
+//      page served with the genuine host's certificate, which is precisely
+//      what made a rogue-client phish convincing.
+//
+//   2. BROWSER BINDING. The pending handle is a bearer value. Without
+//      binding it to the browser that started the flow, an attacker can run
+//      /authorize themselves and hand the resulting consent link to a
+//      victim, who then types their app password into a legitimate-looking
+//      page and mints a code for the ATTACKER's redirect_uri. beginConsent
+//      therefore sets an HttpOnly/Secure/SameSite=Lax cookie scoped to
+//      /consent, and POST /consent requires it to match.
+import { randomToken, hashToken, timingSafeEqualHex } from './crypto.ts';
+import type { PendingStore, CredentialStore, SqliteClientsStore, TokenStore } from './store.ts';
 import type { MailcowOAuthProvider } from './provider.ts';
 import type { ImapVerifier } from './verify.ts';
 
@@ -19,51 +40,158 @@ export type ConsentDeps = {
   credentials: CredentialStore;
   provider: MailcowOAuthProvider;
   clientsStore: SqliteClientsStore;
+  tokens: TokenStore;
   verify: ImapVerifier;
   imapHost: string;
   imapPort: number;
 };
 
+// The narrowest slice of express.Response beginConsent needs. Declared
+// structurally so this module stays testable without an HTTP server.
+export type CookieSetter = {
+  cookie(name: string, value: string, options: Record<string, unknown>): unknown;
+  clearCookie?(name: string, options: Record<string, unknown>): unknown;
+};
+
+export const CONSENT_COOKIE = 'mailcp_consent';
+
+// Path-scoped so it is never sent to /mcp, /token or anything else; Lax
+// rather than Strict because the browser arrives at /consent via a
+// cross-site redirect from the client's own /authorize call, which Strict
+// would drop. Not a __Host- prefix: that mandates Path=/, which would
+// broaden the cookie to every route on the origin.
+const COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'lax' as const,
+  path: '/consent',
+  maxAge: 600_000,
+};
+
 const ESCAPE_MAP: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => ESCAPE_MAP[c]!);
 
-// `mailbox` is only ever the value to redisplay in the form -- it is never
-// used to decide anything security-relevant here, so passing an empty
-// default when there's nothing to prefill is safe.
-export function renderConsent(handle: string, error?: string, mailbox = ''): string {
+const UNKNOWN_CLIENT = 'an unidentified application';
+const UNKNOWN_DESTINATION = '(unknown)';
+
+export type ConsentView = {
+  handle: string;
+  /** The requesting client's registered name. Attacker-chosen; escaped, never trusted. */
+  clientName: string;
+  /** Origin of the registered redirect_uri. Attacker-chosen but not forgeable as someone else's. */
+  redirectOrigin: string;
+  error?: string;
+  /** Only ever the value to redisplay in the form; never used to decide anything. */
+  mailbox?: string;
+};
+
+/**
+ * The origin a successful consent will send the browser to.
+ *
+ * Custom-scheme redirect URIs (com.example.app://cb) serialise to the string
+ * "null" as an origin, which tells a reader nothing -- show the whole URI in
+ * that case instead. Either way the result is escaped before rendering.
+ */
+export function redirectDestination(redirectUri: string): string {
+  try {
+    const url = new URL(redirectUri);
+    return url.origin && url.origin !== 'null' ? url.origin : redirectUri;
+  } catch {
+    return redirectUri || UNKNOWN_DESTINATION;
+  }
+}
+
+/** Everything the page needs to identify the requester, resolved from a handle. */
+export function consentView(deps: ConsentDeps, handle: string): ConsentView {
+  const pending = deps.pending.get(handle);
+  if (!pending) return { handle, clientName: UNKNOWN_CLIENT, redirectOrigin: UNKNOWN_DESTINATION };
+  const client = deps.clientsStore.getClient(pending.clientId);
+  return {
+    clientName: client?.client_name || UNKNOWN_CLIENT,
+    redirectOrigin: redirectDestination(pending.redirectUri),
+    handle,
+  };
+}
+
+export function renderConsent(v: ConsentView): string {
   return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Connect your mailbox</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 30rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+.dest { display: block; margin: .5rem 0 1rem; padding: .75rem 1rem; border: 2px solid #333; border-radius: .4rem;
+        font-family: ui-monospace, monospace; font-size: 1.15rem; font-weight: 700; word-break: break-all; }
+.who { font-size: 1.05rem; }
+.warn { color: #6b4d00; background: #fff8e1; border-left: 4px solid #c79100; padding: .6rem .8rem; font-size: .92rem; }
+.err { color: #b00; }
+label { display: block; margin-bottom: 1rem; }
+input { width: 100%; box-sizing: border-box; padding: .4rem; font-size: 1rem; }
+</style>
 </head>
-<body style="font-family:system-ui;max-width:28rem;margin:3rem auto;padding:0 1rem">
+<body>
 <h1>Connect your mailbox</h1>
-<p>Enter your mailbox address and an <strong>IMAP-only app password</strong> created in mailcow. This grants Claude read-only access to your mail.</p>
-${error ? `<p style="color:#b00" role="alert">${esc(error)}</p>` : ''}
+<p class="who">The application <strong>${esc(v.clientName)}</strong> is asking for read-only access to your mailbox.</p>
+<p>If you continue, your browser will be sent to:</p>
+<code class="dest">${esc(v.redirectOrigin)}</code>
+<p class="warn">Anyone can register an application with this server and choose the name shown above, so the name proves nothing. The address in the box is the part they cannot fake. <strong>Stop now</strong> if you did not start this from that application.</p>
+${v.error ? `<p class="err" role="alert">${esc(v.error)}</p>` : ''}
 <form method="post" action="/consent">
-<input type="hidden" name="handle" value="${esc(handle)}">
-<label>Mailbox<br><input name="mailbox" type="email" required value="${esc(mailbox)}" style="width:100%"></label><br><br>
-<label>App password<br><input name="app_password" type="password" required autocomplete="off" style="width:100%"></label><br><br>
+<input type="hidden" name="handle" value="${esc(v.handle)}">
+<label>Mailbox<br><input name="mailbox" type="email" required value="${esc(v.mailbox ?? '')}"></label>
+<label>App password (an <strong>IMAP-only</strong> app password created in mailcow)<br><input name="app_password" type="password" required autocomplete="off"></label>
 <button type="submit">Authorise</button>
 </form>
 </body>
 </html>`;
 }
 
+/**
+ * Start a consent flow: store the pending authorization, bind it to this
+ * browser with a cookie, and return the URL to redirect to.
+ *
+ * The cookie is set here rather than by the caller so the binding cannot be
+ * accidentally separated from the handle it protects.
+ */
 export function beginConsent(
   deps: ConsentDeps,
+  res: CookieSetter,
   p: { clientId: string; redirectUri: string; codeChallenge: string; state?: string; resource?: string; scopes?: string[] },
 ): string {
   const handle = randomToken();
-  deps.pending.save(handle, { ...p, ttlSec: 600 });
+  // A second, independent secret. The handle travels in a URL (logs,
+  // Referer, shoulder-surfing); this one only ever travels in a
+  // path-scoped HttpOnly cookie, so holding the URL is not enough.
+  const browserToken = randomToken();
+  deps.pending.save(handle, { ...p, browserToken, ttlSec: 600 });
+  res.cookie(CONSENT_COOKIE, browserToken, COOKIE_OPTIONS);
   return `/consent?handle=${encodeURIComponent(handle)}`;
+}
+
+/** Pull the consent binding value out of a raw Cookie header. */
+export function readConsentCookie(header: string | undefined): string {
+  if (typeof header !== 'string') return '';
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() !== CONSENT_COOKIE) continue;
+    const raw = part.slice(eq + 1).trim();
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+  return '';
 }
 
 export async function handleConsent(
   deps: ConsentDeps,
   body: { handle?: string; mailbox?: string; app_password?: string },
+  browserToken: string,
+  res?: CookieSetter,
 ): Promise<{ redirectTo: string } | { rerender: string }> {
   // The declared parameter type is a compile-time shape only -- Node strips
   // types without checking them at runtime, and a real HTTP request is not
@@ -85,27 +213,60 @@ export async function handleConsent(
   // real pending row is ever stored under an empty handle.
   const pending = deps.pending.get(handle);
   if (!pending) {
-    return { rerender: renderConsent(handle, 'This authorisation request has expired or was already used. Start again from Claude.') };
+    return {
+      rerender: renderConsent({
+        handle,
+        clientName: UNKNOWN_CLIENT,
+        redirectOrigin: UNKNOWN_DESTINATION,
+        error: 'This authorisation request has expired or was already used. Start again from the application you are connecting.',
+      }),
+    };
+  }
+
+  const view = consentView(deps, handle);
+
+  // Browser binding. Without this, an attacker runs /authorize in THEIR
+  // browser, sends the victim the resulting /consent link, and the victim's
+  // app password mints a code that redirects to the attacker's own
+  // redirect_uri. A missing cookie and a wrong cookie are the same answer.
+  const expected = pending.browserTokenHash;
+  if (!expected || typeof browserToken !== 'string' || !browserToken || !timingSafeEqualHex(hashToken(browserToken), expected)) {
+    return {
+      rerender: renderConsent({
+        ...view,
+        error:
+          'This authorisation request was not started in this browser, so it cannot be completed here. Start the connection again from the application itself, in this browser.',
+      }),
+    };
   }
 
   const mailboxInput = typeof body.mailbox === 'string' ? body.mailbox : '';
   const mailbox = mailboxInput.trim().toLowerCase();
   const appPassword = typeof body.app_password === 'string' ? body.app_password : '';
   if (!mailbox || !appPassword) {
-    return { rerender: renderConsent(handle, 'Both fields are required.', mailbox) };
+    return { rerender: renderConsent({ ...view, error: 'Both fields are required.', mailbox }) };
   }
 
   // The credential must be proven before anything is stored or issued: no
   // store, no code, on a failed verification.
   const ok = await deps.verify(deps.imapHost, deps.imapPort, mailbox, appPassword);
   if (!ok) {
-    return { rerender: renderConsent(handle, 'Could not sign in to that mailbox with that app password.', mailbox) };
+    return { rerender: renderConsent({ ...view, error: 'Could not sign in to that mailbox with that app password.', mailbox }) };
   }
 
   const client = deps.clientsStore.getClient(pending.clientId);
   if (!client) {
-    return { rerender: renderConsent(handle, 'Unknown client. Start again from Claude.', mailbox) };
+    return { rerender: renderConsent({ ...view, error: 'Unknown client. Start again from the application you are connecting.', mailbox }) };
   }
+
+  // Grant eviction. A completed consent is the user asserting who may read
+  // this mailbox NOW, so every token previously issued for it dies here --
+  // across all clients, not just this one. Before this, a victim who
+  // removed and re-added the connector left an attacker's 30-day
+  // self-rotating token working, and the only real kill switch was deleting
+  // the app password in mailcow (still documented in deploy/README.md as
+  // the out-of-band one, since it also stops a stolen credential).
+  deps.tokens.revokeAllBySubject(mailbox);
 
   deps.credentials.put(mailbox, deps.imapHost, deps.imapPort, appPassword);
 
@@ -123,6 +284,7 @@ export async function handleConsent(
   // Delete only after everything has succeeded, so a failure earlier in this
   // function leaves the handle intact and retryable.
   deps.pending.delete(handle);
+  res?.clearCookie?.(CONSENT_COOKIE, { path: COOKIE_OPTIONS.path });
 
   // The redirect target comes ONLY from the pending row saved at
   // authorization time -- never from the consent POST body -- so a

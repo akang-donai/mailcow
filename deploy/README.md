@@ -316,6 +316,45 @@ Then, in Claude:
 Each mailcow user enrolls themselves this way; nobody needs a shared or
 admin credential to use the connector.
 
+**What the consent screen shows, and why it matters.** Dynamic client
+registration is open by specification: anyone on the internet can register a
+client with this server and choose both its displayed name and the address
+the browser is sent to afterwards. The consent page therefore names the
+client that actually asked and shows, prominently, the **origin** of that
+redirect address. The name proves nothing -- it is attacker-chosen -- but
+the origin is the part that cannot be faked as somebody else's. Tell users:
+if that box does not show the application they just started this from, stop
+and close the page. The page is also bound to the browser that began the
+flow (an HttpOnly cookie set at `/authorize`), so a consent link someone
+else sends you cannot be completed in your browser at all.
+
+## 5a. Revoking access
+
+Three levers, in increasing order of severity.
+
+**The user re-runs consent.** Completing a fresh consent for a mailbox
+revokes every token previously issued for it, across all clients. This is
+the in-band kill switch, and it is what "remove and re-add the connector in
+Claude" now actually does. Use it if a user suspects a connector they did
+not authorise.
+
+**Delete the app password in mailcow** (user panel -> App Passwords ->
+delete). This is the **out-of-band kill switch** and the only one that
+works when the connector service itself is not trusted, or when the
+credential is believed to have leaked from somewhere else entirely. It
+stops the stored copy from authenticating to Dovecot at all, so it holds
+even against a token this service has not managed to revoke and against an
+attacker who copied the credential out of the database. Tool calls then
+return the re-authorisation message, and `invalid_since` is set on the
+credential row.
+
+**Wipe the credentials table** (`docker compose down`, then delete
+`deploy/data/mailcp.sqlite*` and bring the stack back up) if the whole
+service is suspect. Every enrolled user must then redo the consent flow
+with a new app password. The AES key in `deploy/secrets/key` can stay --
+losing it makes existing rows undecryptable, which is the same outcome by a
+worse route.
+
 ## 6. Rollback
 
 From `deploy/`:
