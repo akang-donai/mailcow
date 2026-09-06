@@ -20,6 +20,10 @@ test('rejects a missing IMAP host', () => {
   assert.throws(() => loadRemoteConfig({ ...base, MAILCOW_IMAP_HOST: undefined }), /MAILCOW_IMAP_HOST/);
 });
 
-test('rejects a cleartext IMAP port', () => {
+test('rejects a cleartext IMAP port (143)', () => {
   assert.throws(() => loadRemoteConfig({ ...base, MAILCOW_IMAP_PORT: '143' }), /cleartext|TLS/i);
+});
+
+test('rejects a cleartext IMAP port (110)', () => {
+  assert.throws(() => loadRemoteConfig({ ...base, MAILCOW_IMAP_PORT: '110' }), /cleartext|TLS/i);
 });

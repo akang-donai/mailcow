@@ -10,6 +10,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
+import { OAuthError, ServerError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { MailcowOAuthProvider } from './provider.ts';
 import type { SqliteClientsStore, PendingStore, CredentialStore } from './store.ts';
 import type { TenantRegistry } from './tenant-connections.ts';
@@ -37,8 +38,57 @@ function setConsentSecurityHeaders(res: express.Response): void {
   res.set('Content-Security-Policy', "default-src 'none'; form-action 'self'; style-src 'unsafe-inline'");
 }
 
+// Terminal error handler -- Express identifies this as error-handling
+// middleware purely by its four declared parameters (the unused `next` is
+// required for that; dropping it turns this into an ordinary, never-called
+// middleware). Mounted last, after every route.
+//
+// The SDK's own OAuth handlers (register/token/authorize) already catch and
+// format their own errors internally and reply directly -- they never call
+// next(err) for those, so a structured OAuthError essentially never reaches
+// this handler in practice. It only activates for what those internal
+// try/catches can't see: a body-parser failure upstream of a route (e.g.
+// malformed JSON POSTed to /register throws inside express.json(), before
+// the SDK's handler ever runs), or an unexpected exception thrown by our
+// own route logic. Express's default error path would otherwise embed
+// `err.stack` -- absolute filesystem paths, dependency internals -- in the
+// HTTP response to a completely unauthenticated caller.
+function errorHandler(err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction): void {
+  // A streamed/partially-sent response can't be rewritten; Express's own
+  // default handler is the correct place to close the connection out.
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  // Preserve the SDK's own status/body convention for a structured OAuth
+  // error, in the rare case one does reach this far -- clients parse
+  // {"error": "...", "error_description": "..."} and depend on the code.
+  if (err instanceof OAuthError) {
+    const status = err instanceof ServerError ? 500 : 400;
+    res.status(status).json(err.toResponseObject());
+    return;
+  }
+  // Anything else is unexpected: the real error (and its stack) goes to
+  // the server log only, never into the response body.
+  console.error('mailcp remote: unhandled request error', err);
+  res.status(500).json({ error: 'server_error', error_description: 'Internal server error' });
+}
+
 export function buildApp(deps: AppDeps): Express {
   const app = express();
+
+  // Standard hardening: don't advertise the framework in responses.
+  app.disable('x-powered-by');
+
+  // nginx terminates TLS on this same host and proxies to loopback, so
+  // every request's TCP peer is 127.0.0.1 -- without this, the SDK's
+  // built-in rate limiters on /register, /authorize and /token key every
+  // tenant's traffic to that single address, so one noisy user throttles
+  // the entire mail domain. 'loopback' (never `true`) trusts only
+  // 127.0.0.1/::1 as a forwarding proxy -- exactly and only nginx -- so a
+  // client that reached this process directly still can't spoof
+  // X-Forwarded-For to evade the limiter.
+  app.set('trust proxy', 'loopback');
 
   const consentDeps = {
     pending: deps.pending,
@@ -106,6 +156,10 @@ export function buildApp(deps: AppDeps): Express {
       await transport.handleRequest(req, res, req.body);
     },
   );
+
+  // Must be registered after every route -- Express only reaches
+  // error-handling middleware that comes after the throw site in the stack.
+  app.use(errorHandler);
 
   return app;
 }
