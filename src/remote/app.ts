@@ -219,6 +219,25 @@ export function buildApp(deps: AppDeps): Express {
     },
   );
 
+  // Anything other than POST on /mcp. Registered AFTER the POST route, so a
+  // real POST is handled above and never reaches this.
+  //
+  // The MCP spec has a server with no standalone SSE stream answer GET /mcp
+  // with 405, and the same goes for DELETE when there is no session to
+  // terminate -- this transport runs stateless (sessionIdGenerator:
+  // undefined), so neither exists here. Without this, Express's default
+  // 404 handler replied with an HTML error page to a client that sent
+  // Accept: application/json, which reads as "broken server" rather than
+  // "that method is not offered".
+  app.all('/mcp', (_req, res) => {
+    res.set('Allow', 'POST');
+    res.status(405).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method Not Allowed: this server offers no standalone SSE stream and no session to terminate; use POST.' },
+      id: null,
+    });
+  });
+
   // Must be registered after every route -- Express only reaches
   // error-handling middleware that comes after the throw site in the stack.
   app.use(errorHandler);

@@ -226,3 +226,46 @@ test('trust proxy is not true and not loopback', async () => {
   assert.notEqual(trust, 'loopback');
   assert.equal(trust, 1);
 });
+
+// ---------------------------------------------------------------------------
+// /mcp method handling. The transport runs stateless (sessionIdGenerator:
+// undefined), so there is no standalone SSE stream to GET and no session to
+// DELETE. The MCP spec has a server answer 405 in that case; Express's
+// default 404 handler was replying with an HTML error page instead, which
+// reads as a broken server rather than an unoffered method.
+// ---------------------------------------------------------------------------
+
+for (const method of ['GET', 'DELETE', 'PUT', 'PATCH']) {
+  test(`${method} /mcp returns a JSON 405, not an HTML 404`, async () => {
+    const { app } = fixture();
+    const server = await listen(app);
+    try {
+      const res = await fetch(`${baseUrl(server)}/mcp`, { method, headers: { accept: 'application/json' } });
+
+      assert.equal(res.status, 405);
+      assert.match(res.headers.get('content-type') ?? '', /application\/json/);
+      assert.equal(res.headers.get('allow'), 'POST');
+      const body = (await res.json()) as { jsonrpc?: string; error?: { code?: number; message?: string } };
+      assert.equal(body.jsonrpc, '2.0');
+      assert.equal(typeof body.error?.code, 'number');
+      assert.match(body.error!.message!, /POST/);
+    } finally {
+      server.close();
+    }
+  });
+}
+
+test('POST /mcp is unaffected by the 405 fallback and still reaches bearer auth', async () => {
+  const { app } = fixture();
+  const server = await listen(app);
+  try {
+    const res = await fetch(`${baseUrl(server)}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    assert.equal(res.status, 401, 'POST must still be handled by the real route, not the 405 fallback');
+  } finally {
+    server.close();
+  }
+});

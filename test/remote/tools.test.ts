@@ -639,3 +639,42 @@ test('a zero-width-space marker in an attachment filename is defanged', async ()
   const asRead = output.replace(/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g, '').normalize('NFKC');
   assert.equal((asRead.match(/END UNTRUSTED\s+EMAIL\s+CONTENT/g) ?? []).length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Permanent vs transient argument errors. An unparseable `since` threw from
+// inside `guard`, which classifies anything that isn't an authentication
+// failure as transient -- so the model was told to "try again in a moment"
+// for a call that can never succeed as written, and looped on it.
+// ---------------------------------------------------------------------------
+
+test('an unparseable since is a permanent argument error, not a try-again-later', async () => {
+  const { callTool } = await harness({ 'harry@x': { searchResult: [], envelopes: {} } });
+
+  const result = await callTool('search_messages', { since: 'last tuesday' }, 'harry@x');
+
+  assert.equal(result.isError, true, 'a permanent argument error must be marked as an error');
+  const output = textOf(result);
+  assert.match(output, /since/i);
+  assert.match(output, /last tuesday/, 'the model must be told which value was rejected');
+  assert.doesNotMatch(output, /try again in a moment/i, 'this call cannot succeed on retry; saying so causes a loop');
+});
+
+test('a bad since never reaches IMAP at all', async () => {
+  const searchCalls: Array<{ user: string; query: unknown }> = [];
+  const { callTool } = await harness({ 'harry@x': { searchResult: [1] } }, { searchCalls });
+
+  await callTool('search_messages', { since: 'not-a-date' }, 'harry@x');
+
+  assert.equal(searchCalls.length, 0, 'a rejected argument must not open a connection or run a search');
+});
+
+test('a valid since still searches normally', async () => {
+  const searchCalls: Array<{ user: string; query: unknown }> = [];
+  const { callTool } = await harness({ 'harry@x': { searchResult: [] } }, { searchCalls });
+
+  const result = await callTool('search_messages', { since: '2026-01-31' }, 'harry@x');
+
+  assert.notEqual(result.isError, true);
+  assert.equal(searchCalls.length, 1);
+  assert.ok((searchCalls[0]!.query as any).since instanceof Date);
+});

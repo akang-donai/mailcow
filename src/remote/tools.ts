@@ -3,7 +3,7 @@ import { simpleParser } from 'mailparser';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { listFolders, searchSummaries, fetchEnvelopes, fetchMessageSource, type ImapLike } from '../mailbox.ts';
-import { buildSearchQuery } from '../search.ts';
+import { buildSearchQuery, sinceError } from '../search.ts';
 import { formatSummary, formatMessage, sanitizeHeaderValue, wrapUntrusted } from '../format.ts';
 import { TenantRegistry, CredentialUnavailableError } from './tenant-connections.ts';
 import type { CredentialStore } from './store.ts';
@@ -28,6 +28,11 @@ const TRANSIENT =
   'Could not reach your mailbox right now. This looks like a temporary problem, not a permission issue -- please try again in a moment.';
 
 const text = (body: string) => ({ content: [{ type: 'text' as const, text: body }] });
+
+// A permanent argument error: the call cannot succeed as written, so say so
+// rather than letting the model retry it. isError marks it as a failure
+// rather than as an answer.
+const argumentError = (body: string) => ({ content: [{ type: 'text' as const, text: body }], isError: true as const });
 
 // Message-derived output. Everything a tool reports about a message --
 // sender, subject, filename, body -- is written by whoever sent the mail,
@@ -149,6 +154,13 @@ export function registerRemoteTools(
     },
     async ({ folder, limit, ...filters }, extra) => {
       const subject = subjectFromExtra(extra);
+      // Validated BEFORE the guard. buildSearchQuery throws for an
+      // unparseable `since`, and inside the guard any throw that isn't an
+      // authentication failure is classified as transient -- so a permanent
+      // argument error was reported to the model as "try again in a
+      // moment", and it looped on the identical call.
+      const badSince = sinceError(filters);
+      if (badSince) return argumentError(sanitizeHeaderValue(badSince));
       const r = await guard(subject, async () => {
         const imap = await imapFor(subject);
         const uids = await searchSummaries(imap, folder, buildSearchQuery(filters), limit);
