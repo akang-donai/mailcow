@@ -1,0 +1,20 @@
+{
+  "name": "mailcow-imap-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only IMAP MCP server for mailcow",
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "start": "node src/server.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "imapflow": "^1.7.8",
+    "mailparser": "^3.9.22",
+    "zod": "^4.5.4"
+  }
+}
