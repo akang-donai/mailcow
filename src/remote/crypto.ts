@@ -32,7 +32,13 @@ export function hashToken(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
+function isValidHex(s: string): boolean {
+  if (s.length % 2 !== 0) return false;
+  return /^[0-9a-f]*$/.test(s);
+}
+
 export function timingSafeEqualHex(a: string, b: string): boolean {
+  if (!isValidHex(a) || !isValidHex(b)) return false;
   if (a.length !== b.length) return false;
   return timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 }

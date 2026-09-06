@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Read-only IMAP MCP server for mailcow",
   "scripts": {
-    "test": "node --test \"test/*.test.ts\"",
+    "test": "node --test \"test/**/*.test.ts\"",
     "start": "node src/server.ts"
   },
   "engines": {

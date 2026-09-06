@@ -60,3 +60,19 @@ test('timingSafeEqualHex compares equal and unequal hex of same length', () => {
 test('timingSafeEqualHex is false for different-length inputs, no throw', () => {
   assert.equal(timingSafeEqualHex('aa', 'aabb'), false);
 });
+
+test('timingSafeEqualHex with non-hex chars like gg returns false, no throw', () => {
+  assert.equal(timingSafeEqualHex('gg', 'ab'), false);
+});
+
+test('timingSafeEqualHex with identical invalid hex returns false, no throw', () => {
+  assert.equal(timingSafeEqualHex('zz', 'zz'), false);
+});
+
+test('timingSafeEqualHex with odd-length hex returns false, no throw', () => {
+  assert.equal(timingSafeEqualHex('abc', 'abd'), false);
+});
+
+test('timingSafeEqualHex with empty strings returns true', () => {
+  assert.equal(timingSafeEqualHex('', ''), true);
+});
